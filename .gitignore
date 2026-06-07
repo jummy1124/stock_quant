@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 本機資料 / 輸出
+*.db
+*.sqlite3
+*.csv
+*.log
+
+# 編輯器 / 作業系統
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
