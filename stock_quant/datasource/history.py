@@ -29,11 +29,28 @@ def _recent_month_firsts(months: int, today: Optional[date] = None) -> list[date
     return list(reversed(firsts))   # 升冪
 
 
-def _row_to_quote(symbol, market, raw_date, r) -> Optional[DailyQuote]:
-    """共用: 由一列 [日期,量,額,開,高,低,收,漲跌,筆數] 組 DailyQuote。"""
+def _to_int(raw) -> Optional[int]:
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(",", "")
+    if s in ("", "--", "-"):
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def _row_to_quote(symbol, market, raw_date, r, volume_mult: int = 1) -> Optional[DailyQuote]:
+    """共用: 由一列 [日期,量,額,開,高,低,收,漲跌,筆數] 組 DailyQuote。
+
+    volume_mult: 成交量單位換算。TWSE 回「股」用 1；TPEx tradingStock 回「張」用 1000。
+    """
     d = parse_roc_date(raw_date)
     if d is None:
         return None
+    raw_vol = _to_int(r[1]) if len(r) > 1 else None
+    volume = raw_vol * volume_mult if raw_vol is not None else None
     q = DailyQuote.normalize(
         symbol=symbol, name="", market=market, trade_date=d,
         open=r[3] if len(r) > 3 else None,
@@ -41,7 +58,7 @@ def _row_to_quote(symbol, market, raw_date, r) -> Optional[DailyQuote]:
         low=r[5] if len(r) > 5 else None,
         close=r[6] if len(r) > 6 else None,
         change=r[7] if len(r) > 7 else None,
-        volume=r[1] if len(r) > 1 else None,
+        volume=volume,
         turnover=r[2] if len(r) > 2 else None,
         transactions=r[8] if len(r) > 8 else None,
     )
@@ -105,7 +122,7 @@ class TpexHistoryDataSource(IHistoryDataSource):
             rows = tables[0].get("data", []) if tables else data.get("aaData", [])
             for r in rows:
                 raw_date = str(r[0]).replace("*", "").strip() if r else None
-                q = _row_to_quote(symbol, self.market, raw_date, r)
+                q = _row_to_quote(symbol, self.market, raw_date, r, volume_mult=1000)
                 if q:
                     quotes.append(q)
             if self._delay:

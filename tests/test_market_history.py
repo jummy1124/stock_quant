@@ -93,3 +93,34 @@ def test_load_market_history_cache(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---- (由 test_trend 移入) 上市逐檔 STOCK_DAY 解析 ----------------------
+def test_twse_history_parses(monkeypatch):
+    from stock_quant.datasource.history import TwseHistoryDataSource
+    payload = {"stat": "OK", "data": [
+        ["115/06/03", "30,000,000", "3.0e10", "1000.00", "1010.00", "995.00", "1005.00", "+5.00", "40000"],
+        ["115/06/04", "31,000,000", "3.1e10", "1005.00", "1015.00", "1000.00", "1012.00", "+7.00", "42000"],
+    ]}
+    monkeypatch.setattr(hist_mod, "get_json", lambda *a, **k: payload)
+    quotes = TwseHistoryDataSource(polite_delay=0).fetch_history("2330", months=1)
+    assert len(quotes) >= 2 and quotes[0].trade_date == date(2026, 6, 3)
+    assert quotes[0].market == Market.TWSE
+    assert quotes[0].volume == 30000000          # 股 (×1)
+
+
+# ---- (由 test_trend 移入) universe 組裝 --------------------------------
+def test_load_universe(monkeypatch):
+    from stock_quant.datasource import twse as twse_mod
+    from stock_quant.datasource import tpex as tpex_mod
+    from stock_quant.universe import load_individual_universe
+    monkeypatch.setattr(twse_mod, "get_json", lambda *a, **k: [
+        {"Code": "2330", "Name": "台積電", "ClosingPrice": "1005"},
+        {"Code": "0050", "Name": "ETF", "ClosingPrice": "180"},
+    ])
+    monkeypatch.setattr(tpex_mod, "get_json", lambda *a, **k: [
+        {"Date": "1150605", "SecuritiesCompanyCode": "6488", "CompanyName": "環球晶", "Close": "505"},
+    ])
+    pairs = load_individual_universe(("twse", "tpex"))
+    assert ("2330", Market.TWSE) in pairs and ("6488", Market.TPEX) in pairs
+    assert all(sym != "0050" for sym, _ in pairs)

@@ -65,13 +65,15 @@ def _fetch_batch(payload) -> list[DailyQuote]:
             continue                    # 連昨收都沒有才放棄
         o, h, l = _num(row.get("o")), _num(row.get("h")), _num(row.get("l"))
         change = (cur - prev) if prev is not None else None
+        vlots = _num(row.get("v"))               # MIS 'v' 單位為「張」
+        volume = int(vlots * 1000) if vlots is not None else None   # 轉「股」與歷史一致
         q = DailyQuote.normalize(
             symbol=row.get("c", ""), name=row.get("n", ""), market=market,
             trade_date=parse_ad_date(row.get("d")) or latest_trading_day(),
             open=o if o is not None else cur,
             high=h if h is not None else cur,
             low=l if l is not None else cur,
-            close=cur, change=change, volume=row.get("v"),
+            close=cur, change=change, volume=volume,
         )
         if q.is_valid():
             out.append(q)
