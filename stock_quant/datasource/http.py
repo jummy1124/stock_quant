@@ -11,9 +11,10 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+# 統一的瀏覽器標頭 (證交所/櫃買/MIS 對 bot UA 較敏感)；get_json 會自動套用
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; stock-quant/0.1; +https://example.local)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
 }
 
 

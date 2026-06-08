@@ -43,3 +43,14 @@ class IDataSource(ABC):
 
         實作需自行處理 HTTP 重試與髒值清洗，並保證回傳的是乾淨資料。
         """
+
+
+def pick(row: dict, *candidates: str):
+    """從一筆 row 依序嘗試多個可能的欄位名，回傳第一個存在(非空)的值。
+
+    官方欄位名偶有調整，用這個方式讓解析對欄位改名有韌性。
+    """
+    for key in candidates:
+        if key in row and row[key] not in (None, ""):
+            return row[key]
+    return None

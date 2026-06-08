@@ -1,93 +1,111 @@
 #!/usr/bin/env python3
-"""盤中即時爬蟲: 盤中時段每分鐘多進程抓全市場個股最新報價並 print。
+"""盤中即時趨勢監控: 盤中(09:00-13:30)每分鐘用即時價重算每檔個股趨勢並 print。
 
 流程:
-  1. 啟動時用 EOD OpenAPI 取得全市場『個股』清單 (universe)。
-  2. 用 MIS 即時 API 分批 + 多進程，每分鐘抓一次最新報價。
-  3. 只在盤中(09:00-13:30, 週一至五)執行，非盤中自動休眠。只 print，不存檔。
+  1. 啟動取得歷史日K:
+       - 全市場 -> 用『逐日整批』(MI_INDEX / TPEx 每日)，對限流友善，並本地快取。
+       - 指定個股 -> 逐檔抓 (檔數少)。
+  2. 盤中每分鐘: 多進程抓 MIS 即時價 -> 接成今日K重算趨勢 -> print 快照。
+  3. 只在盤中執行 (週一至五 09:00-13:30)，非盤中自動休眠。
 
-⚠️ 全市場每分鐘輪詢 MIS 量很大、可能被限流/暫時封鎖。可調 --batch-size / --interval，
-   或改鎖定少數個股以降低風險。
+⚠️ 即時報價走 MIS、有流量限制；技術分析為機率性參考，非投資建議。
 
 用法:
-    python run_intraday.py                 # 盤中每分鐘抓全市場個股
-    python run_intraday.py --once          # 立刻抓一次就結束 (測試用，忽略盤中時段)
-    python run_intraday.py --limit 20      # 每次只印前 20 檔
-    python run_intraday.py --interval 60 --batch-size 40 --procs 8
+    python run_intraday.py                 # 盤中每分鐘監控全市場個股趨勢
+    python run_intraday.py --limit 50      # 只監控前 50 檔
+    python run_intraday.py 2330 2317       # 只監控指定個股 (逐檔抓歷史)
+    python run_intraday.py --once          # 立刻跑一次就結束 (測試)
+    python run_intraday.py --days 75 --no-cache
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from collections import Counter
 from datetime import datetime
 
-from stock_quant.crawler import MultiProcessCrawler
-from stock_quant.datasource import MisRealtimeDataSource
+from stock_quant.analysis import Trend
+from stock_quant.datasource import load_market_history
+from stock_quant.domain import Market
+from stock_quant.intraday import IntradayTrendMonitor
 from stock_quant.scheduler import MarketClock, run_market_loop
-from stock_quant.universe import load_individual_universe
+
+_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "history.pkl")
 
 
-def _fmt(v, nd: int = 2) -> str:
-    if v is None:
-        return "-"
-    try:
-        return f"{float(v):,.{nd}f}"
-    except (TypeError, ValueError):
-        return str(v)
+def _fmt(v):
+    return "-" if v is None else (f"{v:,.2f}" if isinstance(v, float) else str(v))
 
 
-def _print_snapshot(now: datetime, quotes, limit: int) -> None:
-    quotes = sorted(quotes, key=lambda q: q.symbol)
-    print(f"\n===== 即時快照 {now:%Y-%m-%d %H:%M:%S} — 共 {len(quotes)} 檔 =====")
-    rows = quotes if limit <= 0 else quotes[:limit]
-    header = f"{'代號':<7}{'名稱':<11}{'市場':<5}{'成交':>10}{'漲跌':>9}{'開':>10}{'高':>10}{'低':>10}{'量':>10}"
+def _print_snapshot(now: datetime, results) -> None:
+    counter: Counter = Counter()
+    print(f"\n===== 盤中趨勢快照 {now:%Y-%m-%d %H:%M:%S} — 共 {len(results)} 檔 =====")
+    header = f"{'代號':<7}{'市場':<5}{'趨勢':<7}{'分數':>5}{'信心':>7}{'MA5':>10}{'ADX':>8}"
     print(header)
     print("-" * len(header))
-    for q in rows:
-        name = (q.name or "")[:9]
-        print(
-            f"{q.symbol:<7}{name:<11}{q.market.zh:<5}"
-            f"{_fmt(q.close):>10}{_fmt(q.change):>9}"
-            f"{_fmt(q.open):>10}{_fmt(q.high):>10}{_fmt(q.low):>10}{_fmt(q.volume, 0):>10}"
-        )
-    if limit > 0 and len(quotes) > limit:
-        print(f"... (還有 {len(quotes) - limit} 檔未顯示)")
+    for r in sorted(results, key=lambda x: x.symbol):
+        counter[r.trend] += 1
+        mk = r.market.zh if r.market else "-"
+        if r.ok:
+            d = r.details
+            print(f"{r.symbol:<7}{mk:<5}{r.trend.value:<7}{r.score:>+5}{r.confidence:>7}"
+                  f"{_fmt(d.get('ma5')):>10}{_fmt(d.get('adx')):>8}")
+    bull, bear, rng, unk = (counter.get(t, 0) for t in
+                            (Trend.BULLISH, Trend.BEARISH, Trend.RANGING, Trend.UNKNOWN))
+    print(f"統計: 多頭 {bull}、空頭 {bear}、盤整 {rng}、資料不足 {unk}")
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="台股盤中即時個股爬蟲 (multiprocess，每分鐘，僅 print)")
+    parser = argparse.ArgumentParser(description="台股盤中即時趨勢監控 (multiprocess，每分鐘)")
+    parser.add_argument("symbols", nargs="*", help="指定個股 (給了就覆蓋全市場)")
     parser.add_argument("--market", choices=["twse", "tpex", "all"], default="all")
-    parser.add_argument("--limit", type=int, default=0, help="每次最多印幾檔 (0=全部)")
-    parser.add_argument("--interval", type=int, default=60, help="抓取間隔秒數 (預設 60)")
-    parser.add_argument("--batch-size", type=int, default=40, help="每批查詢檔數 (MIS)")
-    parser.add_argument("--procs", type=int, default=None, help="進程數 (預設=批次數)")
-    parser.add_argument("--once", action="store_true", help="只抓一次就結束 (忽略盤中時段)")
-    parser.add_argument("--ignore-hours", action="store_true", help="忽略盤中時段限制，持續執行")
+    parser.add_argument("--days", type=int, default=75, help="歷史交易日數 (全市場模式，預設 75)")
+    parser.add_argument("--months", type=int, default=5, help="歷史月數 (指定個股模式，預設 5)")
+    parser.add_argument("--interval", type=int, default=60, help="更新間隔秒數 (預設 60)")
+    parser.add_argument("--batch-size", type=int, default=40, help="MIS 每批檔數")
+    parser.add_argument("--limit", type=int, default=0, help="最多監控幾檔 (0=全部)")
+    parser.add_argument("--procs", type=int, default=None, help="進程數")
+    parser.add_argument("--no-cache", action="store_true", help="不使用歷史快取")
+    parser.add_argument("--once", action="store_true", help="只跑一次就結束 (忽略盤中時段)")
+    parser.add_argument("--ignore-hours", action="store_true", help="忽略盤中時段限制")
     args = parser.parse_args(argv)
 
-    markets = ("twse", "tpex") if args.market == "all" else (args.market,)
-    print(f"載入 universe (全市場個股清單) ...")
-    pairs = load_individual_universe(markets)
-    print(f"universe 共 {len(pairs)} 檔個股。批次大小 {args.batch_size}，每 {args.interval}s 抓一次。\n")
+    market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
 
-    source = MisRealtimeDataSource(pairs, batch_size=args.batch_size)
-    crawler = MultiProcessCrawler([source], processes=args.procs)
+    if args.symbols:
+        # 少數個股: 逐檔抓歷史
+        pairs = [(s, market) for s in args.symbols]
+        monitor = IntradayTrendMonitor(pairs, months=args.months,
+                                       batch_size=args.batch_size, processes=args.procs)
+        print(f"抓 {len(pairs)} 檔歷史日K (逐檔) ...")
+        cached = monitor.prepare()
+    else:
+        # 全市場: 逐日整批歷史 (對限流友善 + 本地快取)
+        markets = ("twse", "tpex") if args.market == "all" else (args.market,)
+        print("逐日整批抓全市場歷史日K (對限流友善，當天會快取) ...")
+        hist = load_market_history(markets, days=args.days,
+                                   cache_path=None if args.no_cache else _CACHE,
+                                   progress=print)
+        if args.limit > 0:
+            hist = dict(list(hist.items())[:args.limit])
+        pairs = [(sym, series[-1].market) for sym, series in hist.items() if series]
+        monitor = IntradayTrendMonitor(pairs, batch_size=args.batch_size, processes=args.procs)
+        cached = monitor.preload_history(hist)
 
-    def task(now: datetime) -> None:
-        results = crawler.crawl()
-        quotes = [q for r in results if r.ok for q in r.quotes]
-        fails = [r for r in results if not r.ok]
-        _print_snapshot(now, quotes, args.limit)
-        if fails:
-            print(f"({len(fails)} 個批次抓取失敗，例: {fails[0].error})")
+    print(f"已備妥 {cached} 檔歷史。每 {args.interval}s 用即時價重算趨勢。\n")
+    if cached == 0:
+        print("沒有任何歷史資料，請檢查網路或改用 --limit / 指定個股測試。")
+        return 1
 
     if args.once:
-        task(datetime.now())
+        _print_snapshot(datetime.now(), monitor.tick(datetime.now()))
         return 0
 
-    print("進入常駐迴圈 (Ctrl+C 結束) ...")
+    print("進入盤中常駐迴圈 (Ctrl+C 結束) ...")
     try:
-        run_market_loop(task, clock=MarketClock(), interval=args.interval,
+        run_market_loop(lambda now: _print_snapshot(now, monitor.tick(now)),
+                        clock=MarketClock(), interval=args.interval,
                         ignore_hours=args.ignore_hours)
     except KeyboardInterrupt:
         print("\n已停止。")

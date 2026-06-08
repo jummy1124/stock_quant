@@ -11,17 +11,9 @@ from datetime import date
 from typing import Optional, Sequence
 
 from ..domain import DailyQuote, Market, is_individual_stock
-from .base import FetchUnit, IDataSource
+from .base import FetchUnit, IDataSource, pick
 from .dates import latest_trading_day
 from .http import get_json
-
-
-def _pick(row: dict, *candidates: str):
-    """從一筆 row 依序嘗試多個可能的欄位名，回傳第一個存在的值。"""
-    for key in candidates:
-        if key in row and row[key] not in (None, ""):
-            return row[key]
-    return None
 
 
 class TwseDataSource(IDataSource):
@@ -43,7 +35,7 @@ class TwseDataSource(IDataSource):
         rows = get_json(self.URL, timeout=self._timeout)
         quotes: list[DailyQuote] = []
         for row in rows:
-            symbol = _pick(row, "Code", "code")
+            symbol = pick(row, "Code", "code")
             if not symbol:
                 continue
             symbol = str(symbol).strip()
@@ -51,17 +43,17 @@ class TwseDataSource(IDataSource):
                 continue  # 濾掉 ETF / 權證 / 特別股 等非個股
             q = DailyQuote.normalize(
                 symbol=symbol,
-                name=_pick(row, "Name", "name") or "",
+                name=pick(row, "Name", "name") or "",
                 market=self.market,
                 trade_date=self._trade_date,
-                open=_pick(row, "OpeningPrice"),
-                high=_pick(row, "HighestPrice"),
-                low=_pick(row, "LowestPrice"),
-                close=_pick(row, "ClosingPrice"),
-                change=_pick(row, "Change"),
-                volume=_pick(row, "TradeVolume"),
-                turnover=_pick(row, "TradeValue"),
-                transactions=_pick(row, "Transaction"),
+                open=pick(row, "OpeningPrice"),
+                high=pick(row, "HighestPrice"),
+                low=pick(row, "LowestPrice"),
+                close=pick(row, "ClosingPrice"),
+                change=pick(row, "Change"),
+                volume=pick(row, "TradeVolume"),
+                turnover=pick(row, "TradeValue"),
+                transactions=pick(row, "Transaction"),
             )
             if q.is_valid():
                 quotes.append(q)

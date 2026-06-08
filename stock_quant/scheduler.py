@@ -1,16 +1,15 @@
 """盤中時段判斷 + 每分鐘常駐迴圈。
 
-MarketClock: 判斷『現在是否為台股盤中』(預設 09:00–13:30，週一至五)。
-             注意: 只看星期與時間，未含國定假日；假設系統時區為台北時間。
-
-run_market_loop: 常駐迴圈，盤中每 interval 秒呼叫一次 task(now)，
-                 非盤中則休眠等待。可注入 now_fn / sleep_fn / max_iterations 方便測試。
+MarketClock: 判斷現在是否台股盤中 (預設 09:00–13:30，週一至五)。
+             只看星期與時間，未含國定假日；假設系統時區為台北時間。
+run_market_loop: 盤中每 interval 秒呼叫 task(now)，非盤中休眠。
+                 可注入 now_fn / sleep_fn / max_iterations 以便測試。
 """
 from __future__ import annotations
 
+import time as _time
 from datetime import datetime, time
 from typing import Callable, Optional
-import time as _time
 
 
 class MarketClock:
@@ -19,7 +18,7 @@ class MarketClock:
         self.close_t = close_t
 
     def is_trading(self, now: datetime) -> bool:
-        if now.weekday() >= 5:          # 週六/週日
+        if now.weekday() >= 5:
             return False
         return self.open_t <= now.time() <= self.close_t
 
@@ -35,12 +34,11 @@ def run_market_loop(
     sleep_fn: Callable[[float], None] = _time.sleep,
     log_fn: Callable[[str], None] = print,
 ) -> int:
-    """回傳實際執行 task 的次數。max_iterations=None 代表無限常駐。"""
-    ran = 0
-    it = 0
+    clock = clock or MarketClock()
+    ran = it = 0
     while max_iterations is None or it < max_iterations:
         now = now_fn()
-        if ignore_hours or clock_is_trading(clock, now):
+        if ignore_hours or clock.is_trading(now):
             task(now)
             ran += 1
             wait = interval
@@ -52,7 +50,3 @@ def run_market_loop(
             break
         sleep_fn(wait)
     return ran
-
-
-def clock_is_trading(clock: Optional[MarketClock], now: datetime) -> bool:
-    return (clock or MarketClock()).is_trading(now)
