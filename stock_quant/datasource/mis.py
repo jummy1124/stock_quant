@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from decimal import Decimal, InvalidOperation
 from multiprocessing import Pool
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from ..domain import DailyQuote, Market
 from .dates import latest_trading_day, parse_ad_date
@@ -80,9 +80,26 @@ def _fetch_batch(payload) -> list[DailyQuote]:
     return out
 
 
+def _safe_fetch_batch(payload):
+    """子進程工作: 包住 _fetch_batch，單批失敗只回 (空清單, 錯誤訊息)，不讓整次抓取爆掉。
+
+    全市場一次切成數十批，只要其中一批被 MIS 限流/逾時就 raise 的話，pool.map 會把
+    整個 tick 連坐失敗 (整分鐘 0 檔)。改成單批隔離 -> 其餘批次照常回傳，只少這一批。
+    """
+    try:
+        return _fetch_batch(payload), None
+    except Exception as exc:                       # noqa: BLE001 — 蒐集錯誤而非中斷
+        return [], f"{type(exc).__name__}: {exc}"
+
+
 def fetch_realtime(pairs: Sequence[tuple[str, Market]], batch_size: int = 40,
-                   processes: Optional[int] = None, timeout: float = 15.0) -> list[DailyQuote]:
-    """抓一組 (代號,市場) 的盤中即時報價 (批次 + 多進程)。回傳 DailyQuote 清單。"""
+                   processes: Optional[int] = None, timeout: float = 15.0,
+                   on_error: Optional[Callable[[str], None]] = None) -> list[DailyQuote]:
+    """抓一組 (代號,市場) 的盤中即時報價 (批次 + 多進程)。回傳 DailyQuote 清單。
+
+    單批失敗會被隔離 (不影響其他批)；有 on_error 時回報「N/總批 批失敗」摘要，
+    讓盤中能看出是「真的沒有符合」還是「即時資料覆蓋不全」。
+    """
     pairs = [(str(s).strip(), m) for s, m in pairs if str(s).strip()]
     if not pairs:
         return []
@@ -90,8 +107,11 @@ def fetch_realtime(pairs: Sequence[tuple[str, Market]], batch_size: int = 40,
     payloads = [(b, timeout) for b in batches]
     n = processes or min(len(payloads), 8)
     if len(payloads) == 1 or n == 1:
-        results = [_fetch_batch(p) for p in payloads]
+        results = [_safe_fetch_batch(p) for p in payloads]
     else:
         with Pool(processes=n) as pool:
-            results = pool.map(_fetch_batch, payloads)
-    return [q for batch in results for q in batch]
+            results = pool.map(_safe_fetch_batch, payloads)
+    failed = [err for _q, err in results if err]
+    if failed and on_error is not None:
+        on_error(f"即時報價 {len(failed)}/{len(payloads)} 批失敗 (例: {failed[0]})")
+    return [q for batch, _err in results for q in batch]

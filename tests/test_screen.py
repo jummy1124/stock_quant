@@ -104,6 +104,24 @@ def test_insufficient_history():
     assert not r.passed and "MA5" in r.note
 
 
+# ---- 規則4: 成交量依時段比例換算 (盤中公平比較) -------------------------
+def test_volume_pace_early_session_passes():
+    # 早盤 1/3 時段，今日累積量 500 vs 昨日整日 1000 -> 原始量比 0.5 (<1.2 會被刷掉)
+    # 但同時段換算: 0.5 / (1/3) = 1.5 ≥ 1.2 -> 規則4 成立
+    hist = _hist(_HIST_OK, prev_high=100.5, prev_vol=1000)
+    today = _q(100, 105.2, 100, 105, 500)
+    r = BreakoutScreen().check(today, hist, session_fraction=1 / 3)
+    assert r.passed
+    assert r.vol_ratio == 0.5 and r.vol_pace_ratio == 1.5
+
+
+def test_volume_pace_full_session_unchanged():
+    # session_fraction=1.0 (收盤後/完整日K) -> 與原始量比一致，行為不變
+    hist = _hist(_HIST_OK, prev_high=100.5, prev_vol=1000)
+    r = BreakoutScreen().check(_q(100, 105.2, 100, 105, 1100), hist, session_fraction=1.0)
+    assert not r.passed and r.vol_pace_ratio == 1.1   # 1100/1000=1.1 <1.2
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

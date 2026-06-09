@@ -22,6 +22,20 @@ class MarketClock:
             return False
         return self.open_t <= now.time() <= self.close_t
 
+    def session_fraction(self, now: datetime) -> float:
+        """今日已過的盤中時段比例，夾在 (0, 1]。
+
+        開盤前/剛開盤回傳一個小正值 (非 0)，收盤後回傳 1.0。用於把盤中累積量
+        換算成「同時段」量比，避免早盤量天生偏低而幾乎篩不出量增股。
+        """
+        def _mins(t: time) -> int:
+            return t.hour * 60 + t.minute
+        total = _mins(self.close_t) - _mins(self.open_t)
+        if total <= 0:
+            return 1.0
+        elapsed = _mins(now.time()) - _mins(self.open_t)
+        return min(max(elapsed / total, 1.0 / total), 1.0)
+
 
 def run_market_loop(
     task: Callable[[datetime], None],
