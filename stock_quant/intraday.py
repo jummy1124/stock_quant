@@ -59,15 +59,9 @@ class IntradayScreener:
         out: list[tuple[str, Market, ScreenResult]] = []
         for symbol, market in self.pairs:
             hist = self._history.get(symbol)
-            if not hist:
-                continue
             lq = live_by.get(symbol)
-            if lq is not None:
-                today, prev = lq, hist[-1]                 # 今日即時K vs 昨日
-            elif len(hist) >= 2:
-                today, prev = hist[-1], hist[-2]           # 無即時價 -> 退用最後完整日K
-            else:
+            # 選股以「今日即時資料」為準: 沒歷史(無昨收)或這分鐘沒拿到即時價 -> 跳過
+            if not hist or lq is None:
                 continue
-            # 市場以實際資料為準 (pair 的 market 在自動偵測時可能為 None)
-            out.append((symbol, today.market, self.screen.check(today, prev)))
+            out.append((symbol, lq.market, self.screen.check(lq, hist)))  # 今日即時 vs 歷史(到昨日)
         return out

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """盤後選股: 用最近兩個交易日的日K，篩出符合 4 條規則的個股並 print。
 
-篩選規則 (BreakoutScreen): 1.紅K 2.漲幅3%~漲停前一檔 3.上影線≤1% 4.今日量≥1.2×昨日量。
+篩選規則 (BreakoutScreen，六條全符合才入選):
+  1.紅K  2.漲幅3%~漲停前一檔  3.上影線≤1%  4.今日量≥1.2×昨日量
+  5.前一日收盤<五日均線(MA5)  6.今日現價>昨日最高價。
 全市場歷史用『逐日整批』取得 (對限流友善 + 本地快取)。⚠️ 非投資建議。
 
 用法:
@@ -44,18 +46,18 @@ def main(argv=None) -> int:
     screen = BreakoutScreen()
     hits = []
     for sym, series in items:
-        if len(series) < 2:
+        if len(series) < 6:                              # 需 今日 + 至少 5 日歷史 (算 MA5)
             continue
-        res = screen.check(series[-1], series[-2])      # 當日K vs 前一交易日
+        res = screen.check(series[-1], series[:-1])      # 當日K vs 歷史(到前一交易日)
         if res.passed:
             hits.append((sym, series[-1].market, res))
 
     print(f"\n符合 {len(hits)} 檔 / 掃描 {len(items)} 檔")
-    header = f"{'代號':<7}{'市場':<5}{'收盤':>10}{'漲幅%':>8}{'上影線%':>9}{'量比':>8}"
+    header = f"{'代號':<8}{'市場':<6}{'收盤':>11}{'漲幅%':>9}{'上影線%':>11}{'量比':>11}"
     print(header); print("-" * len(header))
     for s, m, r in sorted(hits, key=lambda x: -(x[2].change_pct or 0)):
-        print(f"{s:<7}{m.zh:<5}{_fmt(r.close):>10}{_fmt(r.change_pct):>8}"
-              f"{_fmt(r.upper_shadow_pct):>9}{_fmt(r.vol_ratio):>8}")
+        print(f"{s:<8}{m.zh:<6}{_fmt(r.close):>11}{_fmt(r.change_pct):>9}"
+              f"{_fmt(r.upper_shadow_pct):>11}{_fmt(r.vol_ratio):>11}")
     print("\n註: 技術面選股為機率性參考，非投資建議。")
     return 0
 

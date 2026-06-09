@@ -64,8 +64,12 @@ def _bar(d, o, h, l, c, v):
 def test_screener_tick_with_live_pass(monkeypatch):
     today = date(2026, 6, 5)
     scr = IntradayScreener([("2330", Market.TWSE)], processes=1)
-    scr._history["2330"] = [_bar(today - timedelta(days=1), 99, 100, 98, 100, 1000)]  # 昨收100 量1000
-    live = _bar(today, 100, 105.2, 100, 105, 1500)   # +5%, 上影0.19%, 量1.5x
+    # 5 日歷史(算 MA5): 收盤 102,102,101,101,100 -> MA5=101.2 > 昨收100; 昨日(最後一根)高=100.5
+    closes = [102, 102, 101, 101, 100]
+    hist = [_bar(today - timedelta(days=5 - i), c, (100.5 if i == 4 else c), c - 1, c, 1000)
+            for i, c in enumerate(closes)]
+    scr._history["2330"] = hist
+    live = _bar(today, 100, 105.2, 100, 105, 1500)   # +5%, 上影0.19%, 量1.5x, 收105>昨高100.5
     monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [live])
     rows = scr.tick()
     assert len(rows) == 1
@@ -73,16 +77,16 @@ def test_screener_tick_with_live_pass(monkeypatch):
     assert sym == "2330" and res.passed
 
 
-def test_screener_tick_no_live_uses_history(monkeypatch):
+def test_screener_tick_no_live_skipped(monkeypatch):
+    # 選股以今日即時價為準: 這分鐘沒拿到即時價 -> 跳過 (不可用昨日資料冒充今日命中)
     today = date(2026, 6, 5)
     scr = IntradayScreener([("2330", Market.TWSE)], processes=1)
     scr._history["2330"] = [
         _bar(today - timedelta(days=2), 99, 100, 98, 100, 1000),
-        _bar(today - timedelta(days=1), 100, 105.2, 100, 105, 1500),   # 最後完整日K符合
+        _bar(today - timedelta(days=1), 100, 105.2, 100, 105, 1500),
     ]
     monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [])  # 無即時價
-    rows = scr.tick()
-    assert len(rows) == 1 and rows[0][2].passed       # 退用最後完整日K，仍判定
+    assert scr.tick() == []
 
 
 def test_screener_no_history_skipped(monkeypatch):

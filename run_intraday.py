@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """盤中選股: 盤中(09:00-13:30)每分鐘用即時價篩出符合 4 條規則的個股並 print。
 
-篩選規則 (BreakoutScreen):
-  1. 紅K (收>開)
+篩選規則 (BreakoutScreen，六條全符合才入選):
+  1. 紅K: 收盤 > 開盤
   2. 漲幅 3% ~ 漲停前一檔
   3. 上影線 ≤ 1%
   4. 今日量 ≥ 1.2 × 昨日量
+  5. 前一日收盤 < 五日均線(MA5)
+  6. 今日現價 > 昨日最高價
 
 流程: 啟動取得歷史日K(全市場逐日整批/指定個股逐檔) -> 每分鐘抓 MIS 即時價做篩選。
 只在盤中執行，非盤中自動休眠。⚠️ 技術面選股為機率性參考，非投資建議。
@@ -41,12 +43,12 @@ def _print_snapshot(now: datetime, rows) -> None:
     if not hits:
         print("(目前沒有符合條件的個股)")
         return
-    header = f"{'代號':<7}{'市場':<5}{'收盤':>10}{'漲幅%':>8}{'上影線%':>9}{'量比':>8}"
+    header = f"{'代號':<8}{'市場':<6}{'收盤':>11}{'漲幅%':>9}{'上影線%':>11}{'量比':>11}"
     print(header)
     print("-" * len(header))
     for s, m, r in sorted(hits, key=lambda x: -(x[2].change_pct or 0)):   # 依漲幅排序
-        print(f"{s:<7}{m.zh:<5}{_fmt(r.close):>10}{_fmt(r.change_pct):>8}"
-              f"{_fmt(r.upper_shadow_pct):>9}{_fmt(r.vol_ratio):>8}")
+        print(f"{s:<8}{m.zh:<6}{_fmt(r.close):>11}{_fmt(r.change_pct):>9}"
+              f"{_fmt(r.upper_shadow_pct):>11}{_fmt(r.vol_ratio):>11}")
 
 
 def main(argv=None) -> int:

@@ -18,7 +18,7 @@ from typing import Callable, Optional, Sequence
 from ..domain import DailyQuote, Market, is_individual_stock
 from .http import get_json
 
-_CACHE_VERSION = 2   # 抓取邏輯變更時 +1，使舊快取自動失效
+_CACHE_VERSION = 3   # 抓取邏輯變更時 +1，使舊快取自動失效 (v3: 上櫃量改為股)
 
 
 def _g(row, idx):
