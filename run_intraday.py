@@ -12,26 +12,37 @@
 
 流程: 啟動取得歷史日K(全市場逐日整批/指定個股逐檔) -> 每分鐘抓 MIS 即時價做篩選。
 穩定層: 因即時價是「盤中瞬間值」，單次命中會跨分鐘跳動，故需連續 N 次確認 + 寬限窗才報出。
+LINE 推播: --notify line 時推到 LINE。預設「每日 12:00 彙整一次」(--notify-mode daily)，
+          也可改成即時模式 (--notify-mode realtime，個股一確認就推)。
 只在盤中執行，非盤中自動休眠。⚠️ 技術面選股為機率性參考，非投資建議。
 
+LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
+    A. 專案根目錄放 .env 檔 (建議，已被 .gitignore 忽略):
+           LINE_CHANNEL_TOKEN=你的token
+           LINE_USER_ID=U你的userId
+    B. 直接設環境變數 LINE_CHANNEL_TOKEN / LINE_USER_ID
+
 用法:
-    python run_intraday.py                 # 盤中每分鐘篩全市場個股
-    python run_intraday.py --limit 50      # 只看前 50 檔 (降載)
-    python run_intraday.py 2330 2317       # 只看指定個股
-    python run_intraday.py --no-trend      # 關閉多頭趨勢閘門 (只跑原 6 條)
-    python run_intraday.py --once          # 立刻跑一次就結束 (測試)
+    python run_intraday.py --notify line                  # 每日 12:00 彙整推播 (預設)
+    python run_intraday.py --notify line --notify-time 13:00   # 改成每日 13:00 推
+    python run_intraday.py --notify line --notify-mode realtime # 改成命中即時推
+    python run_intraday.py --limit 50                     # 只看前 50 檔 (降載)
+    python run_intraday.py 2330 2317                      # 只看指定個股
+    python run_intraday.py --no-trend                     # 關閉多頭趨勢閘門 (只跑原 6 條)
+    python run_intraday.py --once                         # 立刻跑一次就結束 (測試)
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, time
 
 from stock_quant.analysis import BreakoutScreen
 from stock_quant.datasource import load_market_history
 from stock_quant.domain import Market
 from stock_quant.intraday import IntradayScreener
+from stock_quant.notify import DailyDigestAlerter, LineNotifier, StableAlerter, load_dotenv
 from stock_quant.scheduler import MarketClock, run_market_loop
 
 _CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "history.pkl")
@@ -39,6 +50,12 @@ _CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "his
 
 def _fmt(v):
     return "-" if v is None else f"{v:,.2f}"
+
+
+def _parse_hhmm(s: str) -> time:
+    """把 'HH:MM' 轉成 datetime.time。"""
+    hh, mm = s.split(":")
+    return time(int(hh), int(mm))
 
 
 def _print_snapshot(now: datetime, rows, screener=None) -> None:
@@ -63,7 +80,24 @@ def _print_snapshot(now: datetime, rows, screener=None) -> None:
               f"{_fmt(r.upper_shadow_pct):>11}{_fmt(vr):>11}")
 
 
+def _build_alerter(enabled: bool, mode: str, notify_time: time):
+    """--notify line 時建立推播器；未設 .env/環境變數則停用並提示。"""
+    if not enabled:
+        return None
+    notifier = LineNotifier()
+    if not notifier.configured:
+        print("⚠️ 已指定 --notify line，但缺 LINE_CHANNEL_TOKEN / LINE_USER_ID "
+              "(.env 或環境變數) -> 暫不推播。")
+        return None
+    if mode == "realtime":
+        print(f"LINE 推播: 即時模式 (收訊者 {len(notifier.user_ids)} 人)")
+        return StableAlerter(notifier)
+    print(f"LINE 推播: 每日 {notify_time:%H:%M} 彙整一次 (收訊者 {len(notifier.user_ids)} 人)")
+    return DailyDigestAlerter(notifier, fire_time=notify_time)
+
+
 def main(argv=None) -> int:
+    load_dotenv()        # 啟動先載入專案根目錄的 .env (不覆蓋已存在的環境變數)
     parser = argparse.ArgumentParser(description="台股盤中選股 (7 規則 + 連續確認穩定層，multiprocess，每分鐘)")
     parser.add_argument("symbols", nargs="*", help="指定個股 (給了就覆蓋全市場)")
     parser.add_argument("--market", choices=["twse", "tpex", "all"], default="all")
@@ -79,6 +113,12 @@ def main(argv=None) -> int:
                         help="確認後即使瞬間不符仍保留幾次 (避免小跳動就消失，預設 1)")
     parser.add_argument("--no-trend", action="store_true",
                         help="關閉多頭趨勢閘門 (rule 7)，只跑原 6 條突破規則")
+    parser.add_argument("--notify", choices=["none", "line"], default="none",
+                        help="命中通知方式 (line 需設 LINE_CHANNEL_TOKEN / LINE_USER_ID)")
+    parser.add_argument("--notify-mode", choices=["daily", "realtime"], default="daily",
+                        help="LINE 推播模式: daily=每日定時彙整一次 (預設)；realtime=命中即時推")
+    parser.add_argument("--notify-time", default="12:00",
+                        help="daily 模式的推播時間 HH:MM (預設 12:00)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (忽略盤中時段)")
     parser.add_argument("--ignore-hours", action="store_true")
@@ -88,6 +128,8 @@ def main(argv=None) -> int:
     # --once 只跑一次，無法累積連續確認 -> 退回單次原始命中 (confirm=1)
     confirm = 1 if args.once else args.confirm_ticks
     screen = BreakoutScreen(require_uptrend=not args.no_trend)
+    notify_time = _parse_hhmm(args.notify_time)
+    alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
 
     if args.symbols:
         pairs = [(s, market) for s in args.symbols]
@@ -116,15 +158,21 @@ def main(argv=None) -> int:
         print("沒有歷史資料，請檢查網路或改用 --limit / 指定個股測試。")
         return 1
 
+    def _cycle(now: datetime) -> None:
+        rows = screener.tick(now)
+        _print_snapshot(now, rows, screener)
+        if alerter is not None:
+            pushed = alerter.process(now, rows)
+            if pushed:
+                print(f"📨 已推 LINE: {', '.join(pushed)}")
+
     if args.once:
-        now = datetime.now()
-        _print_snapshot(now, screener.tick(now), screener)
+        _cycle(datetime.now())
         return 0
 
     print(f"進入盤中常駐迴圈 (Ctrl+C 結束)；需連續 {confirm} 次確認、寬限 {args.grace_ticks} 次 ...")
     try:
-        run_market_loop(lambda now: _print_snapshot(now, screener.tick(now), screener),
-                        clock=MarketClock(), interval=args.interval,
+        run_market_loop(_cycle, clock=MarketClock(), interval=args.interval,
                         ignore_hours=args.ignore_hours)
     except KeyboardInterrupt:
         print("\n已停止。")

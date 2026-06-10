@@ -15,6 +15,11 @@ env/
 *.csv
 *.log
 
+# 環境變數 / 密鑰 (.env 內含 LINE token，切勿進 git；.env.example 為可分享範本)
+.env
+.env.*
+!.env.example
+
 # 編輯器 / 作業系統
 .vscode/
 .idea/
