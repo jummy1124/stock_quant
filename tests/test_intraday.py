@@ -7,12 +7,16 @@ from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from stock_quant.analysis import BreakoutScreen
 from stock_quant.datasource import mis as mis_mod
 from stock_quant.datasource.mis import fetch_realtime
 from stock_quant.domain import DailyQuote, Market
 from stock_quant import intraday as intraday_mod
 from stock_quant.intraday import IntradayScreener, _Stabilizer
 from stock_quant.scheduler import MarketClock, run_market_loop
+
+# 盤中測試聚焦 tick/穩定層流程，用短歷史 -> 關閉多頭趨勢閘門 (趨勢另在 test_screen 測)
+_NOTREND = lambda: BreakoutScreen(require_uptrend=False)
 
 
 def test_fetch_realtime_parses(monkeypatch):
@@ -88,7 +92,8 @@ def _bar(d, o, h, l, c, v):
 # ---- 盤中 tick: 即時價當今日K做篩選 ------------------------------------
 def test_screener_tick_with_live_pass(monkeypatch):
     today = date(2026, 6, 5)
-    scr = IntradayScreener([("2330", Market.TWSE)], processes=1, confirm_ticks=1)
+    scr = IntradayScreener([("2330", Market.TWSE)], processes=1,
+                           confirm_ticks=1, screen=_NOTREND())
     # 5 日歷史(算 MA5): 收盤 102,102,101,101,100 -> MA5=101.2 > 昨收100; 昨日(最後一根)高=100.5
     closes = [102, 102, 101, 101, 100]
     hist = [_bar(today - timedelta(days=5 - i), c, (100.5 if i == 4 else c), c - 1, c, 1000)
@@ -105,7 +110,7 @@ def test_screener_tick_with_live_pass(monkeypatch):
 def test_screener_tick_no_live_skipped(monkeypatch):
     # 選股以今日即時價為準: 這分鐘沒拿到即時價 -> 跳過 (不可用昨日資料冒充今日命中)
     today = date(2026, 6, 5)
-    scr = IntradayScreener([("2330", Market.TWSE)], processes=1)
+    scr = IntradayScreener([("2330", Market.TWSE)], processes=1, screen=_NOTREND())
     scr._history["2330"] = [
         _bar(today - timedelta(days=2), 99, 100, 98, 100, 1000),
         _bar(today - timedelta(days=1), 100, 105.2, 100, 105, 1500),
@@ -115,7 +120,7 @@ def test_screener_tick_no_live_skipped(monkeypatch):
 
 
 def test_screener_no_history_skipped(monkeypatch):
-    scr = IntradayScreener([("9999", Market.TWSE)], processes=1)
+    scr = IntradayScreener([("9999", Market.TWSE)], processes=1, screen=_NOTREND())
     monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [])
     assert scr.tick() == []                            # 無歷史 -> 不納入
 
@@ -139,7 +144,7 @@ def test_stabilizer_passthrough_when_confirm_one():
 def test_screener_tick_stable_after_two_ticks(monkeypatch):
     today = date(2026, 6, 5)
     scr = IntradayScreener([("2330", Market.TWSE)], processes=1,
-                           confirm_ticks=2, grace_ticks=1)
+                           confirm_ticks=2, grace_ticks=1, screen=_NOTREND())
     closes = [102, 102, 101, 101, 100]
     hist = [_bar(today - timedelta(days=5 - i), c, (100.5 if i == 4 else c), c - 1, c, 1000)
             for i, c in enumerate(closes)]
