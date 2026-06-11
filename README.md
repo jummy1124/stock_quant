@@ -1,10 +1,10 @@
-# stock_quant — 台股個股選股 (盤後 + 盤中即時)
+# stock_quant — 台股個股選股 (盤中即時 + 盤後)
 
 物件導向、分層、依賴反轉，零第三方依賴。**用 7 條規則篩出符合的個股**，多進程平行。
-只看普通個股（ETF/權證/特別股/期貨等濾掉）。兩種模式：
+只看普通個股（ETF/權證/特別股/期貨等濾掉）。單一進入點 `run_intraday.py`，資料來源依時間自動切換：
 
-- **盤後**（`run.py`）：用最近交易日日K篩選 → print。
-- **盤中即時**（`run_intraday.py`）：盤中(09:00–13:30)**每分鐘**用 MIS 即時價當「今日K」篩選 → print，可選 LINE 推播。
+- **交易時間（週一至五 09:00–13:30）**：**每分鐘**用 MIS 即時價當「今日K」篩選 → print，可選 LINE 推播。
+- **非交易時間（盤後／開盤前／假日）**：改用**最後一個交易日的完成日K**篩選（用 `--no-screen-when-closed` 可關閉、非盤中就純休眠）。
 
 ## 篩選規則 (BreakoutScreen)
 
@@ -30,6 +30,7 @@
 - **連續確認**：個股需連續 N 次 tick（預設 2）都符合才「確認」入選，過濾單次雜訊。
 - **寬限窗**：確認後即使某次瞬間不符，仍保留幾次（預設 1），避免小跳動就消失。
 - 只有「已確認(stable)」的個股才會被印出/推播。可用 `--confirm-ticks` / `--grace-ticks` 調整（`--once` 自動退回單次）。
+- 非交易時間用完成日K是定案資料、不會跳動，因此**不套穩定層、直接報出**。
 
 即時報價抓取對 MIS 限流也做了**單批錯誤隔離**：整個市場切數十批平行抓，單批限流/逾時不會拖垮整次掃描，並回報「N/總批 失敗」的覆蓋率警告。
 
@@ -55,7 +56,7 @@ token / userId 取得：LINE Developers Console > 你的 channel > **Messaging A
 - `--notify-mode daily`（預設）+ `--notify-time 13:00`：每日定時彙整一次。
 - `--notify-mode realtime`：個股一確認就推（同一檔當天去重只推一次）。
 
-> 注意：是程式自己跑到設定時間才觸發，所以**該時間點程式必須在盤中迴圈裡運行中**。
+> 注意：是程式自己跑到設定時間才觸發，所以**該時間點程式必須在迴圈裡運行中**。
 
 ## 用法
 
@@ -63,21 +64,18 @@ token / userId 取得：LINE Developers Console > 你的 channel > **Messaging A
 cd stock_market
 
 python run_intraday.py --notify line              # 盤中每分鐘篩，每日 13:00 推 LINE (預設)
-python run_intraday.py --notify line --notify-time 13:00      # 改成每日 13:00 推
 python run_intraday.py --notify line --notify-mode realtime   # 改成命中即時推
 python run_intraday.py --limit 50                 # 只看前 50 檔 (降載)
 python run_intraday.py 2330 2317                  # 只看指定個股
 python run_intraday.py --no-trend                 # 關閉多頭趨勢閘門 (只跑原 6 條)
-python run_intraday.py --once                     # 立刻跑一次就結束 (測試)
-
-python run.py                                     # 盤後全市場篩選
-python run.py --market twse --limit 100
+python run_intraday.py --once                     # 立刻跑一次 (盤中=即時 / 非盤中=最後交易日)
+python run_intraday.py --no-screen-when-closed    # 非交易時間純休眠，不用 EOD 資料
 ```
 
-盤中快照輸出範例（只印已確認個股，依漲幅排序）：
+快照輸出範例（標題標示資料來源；只印已確認個股，依漲幅排序）：
 
 ```
-===== 選股快照 2026-06-05 10:00:00 — 確認 1 檔 / 取得即時 1900 檔 / 全市場 1955 檔 =====
+===== 選股快照 2026-06-05 10:00:00 [盤中即時] — 確認 1 檔 / 可篩 1900 檔 / 全市場 1955 檔 =====
 代號     市場           收盤     漲幅%     上影線%      量比
 2330   上市       105.00    5.00     0.19    1.50
 ```
@@ -95,33 +93,32 @@ LINE 日結訊息範例：
 ## 運作方式 (盤中即時 + 每分鐘 + 多進程)
 
 1. **啟動取得歷史日K**：全市場用『逐日整批』（上市 MI_INDEX、上櫃 OTC清單+逐檔），
-   對限流友善並**本地快取** `.cache/history.pkl`；指定個股則逐檔抓。
-2. **盤中每分鐘**：MIS 即時 API **批次 + 多進程**抓現價，當「今日K」與歷史比對篩選，套穩定層。
-3. 只在盤中(週一至五 09:00–13:30)執行，非盤中休眠；**選股只認今日即時資料**，這分鐘沒拿到即時價的個股當次跳過。
+   對 TWSE 限流友善（單請求、退避、**逐日增量快取 `.cache/history.pkl` + 續抓**）；指定個股則逐檔抓。
+2. **交易時間每分鐘**：MIS 即時 API **批次 + 多進程**抓現價，當「今日K」與歷史比對篩選，套穩定層。
+3. **非交易時間**：用最後一個交易日的完成日K篩選（不抓即時）；可用 `--no-screen-when-closed` 關閉。
 4. 視設定在指定時間 / 命中時把確認結果推到 LINE。
 
 ## 專案結構
 
 ```
 stock_market/
-├── run.py                    # 盤後選股
-├── run_intraday.py           # 盤中即時選股 (每分鐘) + LINE 推播
+├── run_intraday.py           # 唯一進入點: 盤中即時 + 盤後 EOD 自動切換 + LINE 推播
 ├── .env.example              # LINE 推播設定範本 (複製成 .env 填值)
 ├── stock_quant/
 │   ├── domain/               # DailyQuote / Market + is_individual_stock
-│   ├── datasource/           # 個股清單(EOD) + 歷史日K + MIS即時 (單批錯誤隔離)
+│   ├── datasource/           # 個股清單(EOD) + 歷史日K(增量快取) + MIS即時 (單批錯誤隔離)
 │   ├── analysis/             # BreakoutScreen 選股篩選器 (7 規則 + 多頭趨勢閘門)
 │   ├── universe.py           # 全市場個股清單
-│   ├── intraday.py           # 盤中選股 (快取歷史 + 每分鐘即時篩選 + 穩定層)
+│   ├── intraday.py           # 選股引擎 (快取歷史 + 盤中即時/盤後EOD 自動切換 + 穩定層)
 │   ├── notify.py             # LINE 推播 + 每日彙整 / 即時彙整 + .env 載入
-│   └── scheduler.py          # 盤中時段判斷 + 每分鐘迴圈 + 已過時段比例
-└── tests/                    # 不需網路的單元測試 (57/57 通過)
+│   └── scheduler.py          # 盤中時段判斷 + 常駐迴圈 + 已過時段比例
+└── tests/                    # 不需網路的單元測試 (63/63 通過)
 ```
 
 ## 資料來源
 
 - 個股清單：TWSE `STOCK_DAY_ALL` / TPEx `tpex_mainboard_daily_close_quotes`
-- 歷史日K：上市 `MI_INDEX`(逐日整批)、上櫃 OTC清單+`tradingStock`(逐檔)；指定個股上市用 `STOCK_DAY`
+- 歷史日K：上市 `MI_INDEX`(逐日整批，rwd 新端點+舊端點備援)、上櫃 OTC清單+`tradingStock`(逐檔)；指定個股上市用 `STOCK_DAY`
 - 盤中即時：`https://mis.twse.com.tw/stock/api/getStockInfo.jsp`
 - LINE 推播：`https://api.line.me/v2/bot/message/push`（Messaging API）
 

@@ -30,7 +30,6 @@ LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
     python run_intraday.py --no-trend                     # 關閉多頭趨勢閘門 (只跑原 6 條)
     python run_intraday.py 2330 2317                      # 只看指定個股
 
-    python run.py                                         # 盤後全市場篩選
 """
 from __future__ import annotations
 
