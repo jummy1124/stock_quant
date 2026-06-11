@@ -81,7 +81,17 @@ def test_run_market_loop_runs_then_skips():
     ran2 = run_market_loop(lambda now: calls.append(now), interval=60, max_iterations=2,
                            now_fn=lambda: datetime(2026, 6, 6, 10, 0),
                            sleep_fn=lambda s: None, log_fn=lambda m: None)
-    assert ran2 == 0
+    assert ran2 == 0                                   # 預設非盤中休眠
+
+
+def test_run_market_loop_run_when_closed():
+    # run_when_closed=True: 非交易時間也會跑 (給 EOD 模式用)
+    calls = []
+    ran = run_market_loop(lambda now: calls.append(now), interval=60, idle_interval=300,
+                          run_when_closed=True, max_iterations=2,
+                          now_fn=lambda: datetime(2026, 6, 6, 10, 0),   # 週六 -> 非交易
+                          sleep_fn=lambda s: None, log_fn=lambda m: None)
+    assert ran == 2 and len(calls) == 2
 
 
 def _bar(d, o, h, l, c, v):
@@ -101,10 +111,11 @@ def test_screener_tick_with_live_pass(monkeypatch):
     scr._history["2330"] = hist
     live = _bar(today, 100, 105.2, 100, 105, 1500)   # +5%, 上影0.19%, 量1.5x, 收105>昨高100.5
     monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [live])
-    rows = scr.tick(datetime(2026, 6, 5, 13, 25))
+    rows = scr.tick(datetime(2026, 6, 5, 13, 25))    # 盤中
     assert len(rows) == 1
     sym, market, res = rows[0]
     assert sym == "2330" and res.passed
+    assert scr.last_source == "live"
 
 
 def test_screener_tick_no_live_skipped(monkeypatch):
@@ -116,13 +127,43 @@ def test_screener_tick_no_live_skipped(monkeypatch):
         _bar(today - timedelta(days=1), 100, 105.2, 100, 105, 1500),
     ]
     monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [])  # 無即時價
-    assert scr.tick() == []
+    assert scr.tick(datetime(2026, 6, 5, 10, 0)) == []
 
 
 def test_screener_no_history_skipped(monkeypatch):
     scr = IntradayScreener([("9999", Market.TWSE)], processes=1, screen=_NOTREND())
     monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [])
-    assert scr.tick() == []                            # 無歷史 -> 不納入
+    assert scr.tick(datetime(2026, 6, 5, 10, 0)) == []     # 無歷史 -> 不納入
+
+
+# ---- 非交易時間: 用最後交易日完成日K ----------------------------------
+def test_screener_tick_eod_when_closed(monkeypatch):
+    # 非盤中 -> 用 history[-1] 當今日K 與更早歷史比對，且不該呼叫 fetch_realtime
+    def _boom(*a, **k):
+        raise AssertionError("非交易時間不該抓即時價")
+    monkeypatch.setattr(intraday_mod, "fetch_realtime", _boom)
+
+    base = date(2026, 6, 5)
+    scr = IntradayScreener([("2330", Market.TWSE)], processes=1, screen=_NOTREND())
+    closes = [102, 102, 101, 101, 100]
+    hist = [_bar(base - timedelta(days=6 - i), c, (100.5 if i == 4 else c), c - 1, c, 1000)
+            for i, c in enumerate(closes)]
+    eod = _bar(base, 100, 105.2, 100, 105, 1500)       # 最後交易日完成日K (符合)
+    scr._history["2330"] = hist + [eod]
+    rows = scr.tick(datetime(2026, 6, 5, 15, 0))       # 收盤後 -> EOD 模式
+    assert scr.last_source == "eod"
+    assert len(rows) == 1 and rows[0].stable and rows[0].result.passed
+
+
+def test_screener_tick_eod_can_be_disabled(monkeypatch):
+    # eod_when_closed=False + 非盤中 -> 仍走即時路徑 (這裡沒即時價 -> 空)
+    scr = IntradayScreener([("2330", Market.TWSE)], processes=1, screen=_NOTREND(),
+                           eod_when_closed=False)
+    scr._history["2330"] = [_bar(date(2026, 6, 4), 99, 100, 98, 100, 1000),
+                            _bar(date(2026, 6, 5), 100, 105.2, 100, 105, 1500)]
+    monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [])
+    assert scr.tick(datetime(2026, 6, 5, 15, 0)) == []
+    assert scr.last_source == "live"
 
 
 # ---- 穩定層: 連續確認 + 寬限窗 ----------------------------------------

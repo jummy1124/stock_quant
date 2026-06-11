@@ -1,11 +1,15 @@
-"""全市場歷史日K 組裝 — 為「全市場」設計，盡量減少請求並避免限流。
+"""全市場歷史日K 組裝 — 為「全市場」設計，盡量減少請求並避免 TWSE 限流。
 
-- 上市: TWSE MI_INDEX『逐日整批』(type=ALLBUT0999) —— 一天一次請求拿到當天全市場，
-        抓 ~75 個交易日只要 ~75 次請求。
-- 上櫃: TPEx 沒有穩定的『逐日整批』端點，故用「先取 OTC 個股清單 + 逐檔抓歷史」
-        (history.get_history，已是新版正確端點)，並以多進程加速、本地快取。
+TWSE MI_INDEX 對連續請求限流很嚴，觸發後會把 IP 擋上「好幾分鐘」。因此本模組:
+  * 每天只打 1 次請求 (rwd 新端點；失敗才退舊端點)，不在封鎖窗內快速重試浪費。
+  * 每天之間留較大間隔 (delay 預設 3s)，盡量不要觸發限流。
+  * 被擋時冷卻後重試 (cooldowns)；連續多天都被擋就「判定 IP 被鎖、停止抓取」，
+    不再硬敲 (硬敲只會養大封鎖)。
+  * 逐日『增量快取 + 續抓』: 抓到的每個交易日存進快取；下次啟動只補「還沒抓到的日子」，
+    所以被擋而中斷時，過幾分鐘再跑就會接著補齊，最終仍能抓到全部。
 
-回傳 {代號: 時間升冪日K序列}。附本地快取: 同一基準日只抓一次。
+上櫃用「OTC 個股清單 + 逐檔抓歷史」(history.get_history，新版端點)，多進程加速、一併快取。
+回傳 {代號: 時間升冪日K序列}。
 """
 from __future__ import annotations
 
@@ -18,18 +22,21 @@ from typing import Callable, Optional, Sequence
 from ..domain import DailyQuote, Market, is_individual_stock
 from .http import get_json
 
-_CACHE_VERSION = 3   # 抓取邏輯變更時 +1，使舊快取自動失效 (v3: 上櫃量改為股)
+_CACHE_VERSION = 4   # v4: 改為逐日增量快取 (twse_days / twse_done / tpex)
+
+_MI_INDEX_URLS = (
+    "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={ymd}&type=ALLBUT0999&response=json",
+    "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={ymd}&type=ALLBUT0999",
+)
+_TWSE_HEADERS = {"Referer": "https://www.twse.com.tw/zh/trading/historical/mi-index.html"}
 
 
 def _g(row, idx):
     return row[idx] if (idx is not None and idx < len(row)) else None
 
 
-def fetch_twse_day(d: date, timeout: float = 10.0) -> list[DailyQuote]:
-    """抓上市某一天全市場個股 (MI_INDEX)。假日/無資料回傳 []。"""
-    url = (f"https://www.twse.com.tw/exchangeReport/MI_INDEX"
-           f"?response=json&date={d:%Y%m%d}&type=ALLBUT0999")
-    data = get_json(url, timeout=timeout)
+def _parse_mi_index(data, d: date) -> list[DailyQuote]:
+    """把 MI_INDEX 回傳的 JSON 解析成個股 DailyQuote 清單 (假日/無資料回 [])。"""
     if str(data.get("stat", "")).upper() != "OK":
         return []
     tables = data.get("tables") or []
@@ -57,6 +64,26 @@ def fetch_twse_day(d: date, timeout: float = 10.0) -> list[DailyQuote]:
             if q.is_valid():
                 out.append(q)
     return out
+
+
+def fetch_twse_day(d: date, timeout: float = 10.0) -> list[DailyQuote]:
+    """抓上市某一天全市場個股 (MI_INDEX)。新端點為主、舊端點備援；假日/無資料回 []。
+
+    每個端點只打一次 (retries=1) —— 限流時快速重試只會浪費封鎖時間窗，重試交給上層冷卻。
+    端點正常回應 (含假日無資料) 直接採用；全部端點連線失敗才丟出最後一個例外。
+    """
+    ymd = f"{d:%Y%m%d}"
+    last_err: Optional[Exception] = None
+    for tmpl in _MI_INDEX_URLS:
+        try:
+            data = get_json(tmpl.format(ymd=ymd), timeout=timeout, headers=_TWSE_HEADERS, retries=1)
+        except Exception as exc:                 # noqa: BLE001 — 換備援端點
+            last_err = exc
+            continue
+        return _parse_mi_index(data, d)
+    if last_err is not None:
+        raise last_err
+    return []
 
 
 def _weekdays_back(today: date, max_attempts: int):
@@ -87,18 +114,27 @@ def _otc_worker(payload):
         return symbol, []
 
 
-def _expected_as_of(today: date) -> str:
-    d = today - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d.isoformat()
+def _read_cache(cache_path: Optional[str]) -> dict:
+    """讀取增量快取 (版本不符或讀不到 -> 視為空，重新累積)。"""
+    if not cache_path or not Path(cache_path).exists():
+        return {}
+    try:
+        with open(cache_path, "rb") as f:
+            c = pickle.load(f)
+        if c.get("ver") == _CACHE_VERSION:
+            return c
+    except Exception:
+        pass
+    return {}
 
 
 def load_market_history(
     markets: Sequence[str] = ("twse", "tpex"),
     days: int = 75,
     timeout: float = 10.0,
-    delay: float = 0.4,
+    delay: float = 3.0,
+    cooldowns: Sequence[float] = (30.0, 90.0),
+    max_consecutive_fail: int = 5,
     cache_path: Optional[str] = None,
     progress: Optional[Callable[[str], None]] = None,
     processes: Optional[int] = None,
@@ -110,70 +146,99 @@ def load_market_history(
     log = progress or (lambda _m: None)
     months = max(4, days // 20 + 1)
 
-    if cache_path and Path(cache_path).exists():
-        try:
-            with open(cache_path, "rb") as f:
-                cached = pickle.load(f)
-            if (cached.get("as_of") == _expected_as_of(today)
-                    and cached.get("ver") == _CACHE_VERSION):
-                log(f"使用快取歷史 ({cache_path})")
-                return cached["data"]
-        except Exception:
-            pass
+    cache = _read_cache(cache_path)
+    twse_days: dict[str, list[DailyQuote]] = dict(cache.get("twse_days", {}))   # iso -> 當日全市場
+    twse_done: set[str] = set(cache.get("twse_done", []))                       # 已成功抓過(含假日空)
+    tpex_cache: dict[str, list[DailyQuote]] = dict(cache.get("tpex", {}))
 
-    hist: dict[str, list[DailyQuote]] = {}
-
-    # 上市: 逐日整批
-    if "twse" in markets:
-        collected = 0
-        for d in _weekdays_back(today, max_attempts=days + 30):
-            if collected >= days:
-                break
-            try:
-                rows = fetch_twse_day(d, timeout=timeout)
-            except Exception as exc:
-                log(f"  [上市] {d} 失敗: {exc}")
-                rows = []
-            if not rows:
-                continue
-            for q in rows:
-                hist.setdefault(q.symbol, []).append(q)
-            collected += 1
-            if collected == 1 or collected % 10 == 0:
-                log(f"  [上市] 已抓 {collected}/{days} 個交易日 ...")
-            if delay:
-                _time.sleep(delay)
-
-    # 上櫃: OTC 清單 + 逐檔 (新版端點)，多進程加速
-    if "tpex" in markets:
-        otc = _otc_universe(timeout=max(timeout, 20.0))
-        log(f"  [上櫃] 共 {len(otc)} 檔，逐檔抓歷史 (首次較久，會快取) ...")
-        payloads = [(s, months) for s in otc]
-        if payloads:
-            n = processes or min(len(payloads), 8)
-            if n == 1 or len(payloads) == 1:
-                for i, p in enumerate(payloads, 1):
-                    sym, quotes = _otc_worker(p)
-                    if quotes:
-                        hist[sym] = quotes
-            else:
-                with Pool(processes=n) as pool:
-                    for i, (sym, quotes) in enumerate(pool.imap_unordered(_otc_worker, payloads), 1):
-                        if quotes:
-                            hist[sym] = quotes
-                        if i % 100 == 0:
-                            log(f"  [上櫃] 已處理 {i}/{len(payloads)} 檔 ...")
-
-    for sym in hist:
-        hist[sym].sort(key=lambda q: q.trade_date)
-
-    if cache_path:
+    def _save():
+        if not cache_path:
+            return
         try:
             Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, "wb") as f:
-                pickle.dump({"as_of": _expected_as_of(today), "ver": _CACHE_VERSION, "data": hist}, f)
-            log(f"歷史已快取至 {cache_path}")
+                pickle.dump({"ver": _CACHE_VERSION, "twse_days": twse_days,
+                             "twse_done": sorted(twse_done), "tpex": tpex_cache}, f)
         except Exception:
             pass
 
+    # 上市: 逐日整批 (增量續抓 + 限流退避)
+    if "twse" in markets:
+        collected = len(twse_days)
+        if collected:
+            log(f"  [上市] 快取已有 {collected} 個交易日，續抓缺的 ...")
+        consecutive_fail = 0
+        for d in _weekdays_back(today, max_attempts=days + 40):
+            if collected >= days:
+                break
+            iso = d.isoformat()
+            if iso in twse_done:                      # 已抓過 -> 跳過 (續抓核心)
+                continue
+            rows: Optional[list[DailyQuote]] = None
+            for attempt in range(len(cooldowns) + 1):
+                try:
+                    rows = fetch_twse_day(d, timeout=timeout)
+                    break
+                except Exception as exc:
+                    if attempt < len(cooldowns):
+                        cd = cooldowns[attempt]
+                        log(f"  [上市] {d} 被擋，{cd:.0f}s 後重試 ({attempt + 1}/{len(cooldowns)}) ...")
+                        _time.sleep(cd)
+                    else:
+                        log(f"  [上市] {d} 放棄: {exc}")
+            if rows is None:                          # 這天連冷卻後都失敗
+                consecutive_fail += 1
+                if consecutive_fail >= max_consecutive_fail:
+                    log(f"  [上市] 連續 {consecutive_fail} 天被擋 -> 判定 IP 被 TWSE 限流，先停止。"
+                        f"已抓的會快取；請等 5~10 分鐘再重跑，會自動接續補齊。")
+                    break
+                continue
+            consecutive_fail = 0
+            twse_done.add(iso)
+            if rows:
+                twse_days[iso] = rows
+                collected += 1
+                if collected == 1 or collected % 10 == 0:
+                    log(f"  [上市] 已抓 {collected}/{days} 個交易日 ...")
+                _save()                               # 邊抓邊存 -> 中斷也不白費
+            if delay:
+                _time.sleep(delay)
+        if collected == 0:
+            log("  [上市] 一天都沒抓到 -> 可能 IP 已被限流，請等幾分鐘再重跑 (會接續)。")
+
+    # 上櫃: OTC 清單 + 逐檔 (新版端點)，多進程加速；有快取就用快取
+    if "tpex" in markets:
+        if tpex_cache:
+            log(f"  [上櫃] 快取已有 {len(tpex_cache)} 檔，沿用。")
+        else:
+            otc = _otc_universe(timeout=max(timeout, 20.0))
+            log(f"  [上櫃] 共 {len(otc)} 檔，逐檔抓歷史 (首次較久，會快取) ...")
+            payloads = [(s, months) for s in otc]
+            if payloads:
+                n = processes or min(len(payloads), 8)
+                if n == 1 or len(payloads) == 1:
+                    for p in payloads:
+                        sym, quotes = _otc_worker(p)
+                        if quotes:
+                            tpex_cache[sym] = quotes
+                else:
+                    with Pool(processes=n) as pool:
+                        for i, (sym, quotes) in enumerate(pool.imap_unordered(_otc_worker, payloads), 1):
+                            if quotes:
+                                tpex_cache[sym] = quotes
+                            if i % 100 == 0:
+                                log(f"  [上櫃] 已處理 {i}/{len(payloads)} 檔 ...")
+            _save()
+
+    _save()
+
+    # 由逐日/逐檔快取組裝成 {代號: 升冪日K}
+    hist: dict[str, list[DailyQuote]] = {}
+    for _iso, rows in twse_days.items():
+        for q in rows:
+            hist.setdefault(q.symbol, []).append(q)
+    for sym, quotes in tpex_cache.items():
+        hist.setdefault(sym, []).extend(quotes)
+    for sym in hist:
+        hist[sym].sort(key=lambda q: q.trade_date)
     return hist

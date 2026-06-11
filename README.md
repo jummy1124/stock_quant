@@ -35,7 +35,7 @@
 
 ## LINE 推播
 
-LINE Notify 已於 2025/3/31 終止，本專案改用 **LINE 官方帳號的 Messaging API push**。加 `--notify line` 即可，**預設每天 12:00 把當日累積到的確認個股彙整成一則推出**（一天 1 則，免費額度無壓力）。
+LINE Notify 已於 2025/3/31 終止，本專案改用 **LINE 官方帳號的 Messaging API push**。加 `--notify line` 即可，**預設每天 13:00 把當日累積到的確認個股彙整成一則推出**（一天 1 則，免費額度無壓力）。
 
 設定（擇一；token 等同密碼，**勿寫進程式或 commit**）：
 
@@ -52,7 +52,7 @@ token / userId 取得：LINE Developers Console > 你的 channel > **Messaging A
 
 推播模式：
 
-- `--notify-mode daily`（預設）+ `--notify-time 12:00`：每日定時彙整一次。
+- `--notify-mode daily`（預設）+ `--notify-time 13:00`：每日定時彙整一次。
 - `--notify-mode realtime`：個股一確認就推（同一檔當天去重只推一次）。
 
 > 注意：是程式自己跑到設定時間才觸發，所以**該時間點程式必須在盤中迴圈裡運行中**。
@@ -62,7 +62,7 @@ token / userId 取得：LINE Developers Console > 你的 channel > **Messaging A
 ```bash
 cd stock_market
 
-python run_intraday.py --notify line              # 盤中每分鐘篩，每日 12:00 推 LINE (預設)
+python run_intraday.py --notify line              # 盤中每分鐘篩，每日 13:00 推 LINE (預設)
 python run_intraday.py --notify line --notify-time 13:00      # 改成每日 13:00 推
 python run_intraday.py --notify line --notify-mode realtime   # 改成命中即時推
 python run_intraday.py --limit 50                 # 只看前 50 檔 (降載)
@@ -85,7 +85,7 @@ python run.py --market twse --limit 100
 LINE 日結訊息範例：
 
 ```
-📈 選股日結 2026-06-11 12:00｜符合 3 檔
+📈 選股日結 2026-06-11 13:00｜符合 3 檔
 2414 上市　收 56.8　漲 9.65%
 6173 上櫃　收 228　漲 8.83%
 2836 上市　收 12.3　漲 3.36%

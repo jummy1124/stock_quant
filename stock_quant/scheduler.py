@@ -2,7 +2,8 @@
 
 MarketClock: 判斷現在是否台股盤中 (預設 09:00–13:30，週一至五)。
              只看星期與時間，未含國定假日；假設系統時區為台北時間。
-run_market_loop: 盤中每 interval 秒呼叫 task(now)，非盤中休眠。
+run_market_loop: 盤中每 interval 秒呼叫 task(now)；非盤中可選擇休眠或仍以較慢頻率執行
+                 (run_when_closed=True 時，給「非交易時間用最後交易日資料」的模式用)。
                  可注入 now_fn / sleep_fn / max_iterations 以便測試。
 """
 from __future__ import annotations
@@ -43,6 +44,7 @@ def run_market_loop(
     interval: int = 60,
     ignore_hours: bool = False,
     idle_interval: int = 30,
+    run_when_closed: bool = False,
     max_iterations: Optional[int] = None,
     now_fn: Callable[[], datetime] = datetime.now,
     sleep_fn: Callable[[float], None] = _time.sleep,
@@ -53,9 +55,13 @@ def run_market_loop(
     while max_iterations is None or it < max_iterations:
         now = now_fn()
         if ignore_hours or clock.is_trading(now):
-            task(now)
+            task(now)                       # 盤中: 即時資料，較高頻
             ran += 1
             wait = interval
+        elif run_when_closed:
+            task(now)                       # 非盤中: 用最後交易日完成日K，較低頻
+            ran += 1
+            wait = idle_interval
         else:
             log_fn(f"[{now:%Y-%m-%d %H:%M:%S}] 非盤中，休眠 {idle_interval}s ...")
             wait = idle_interval

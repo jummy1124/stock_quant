@@ -35,6 +35,49 @@ def test_fetch_twse_day_holiday_returns_empty(monkeypatch):
     assert mh.fetch_twse_day(date(2026, 1, 1)) == []
 
 
+def test_fetch_twse_day_uses_rwd_endpoint(monkeypatch):
+    # 應優先打新的 /rwd/zh/afterTrading/ 端點 (舊 /exchangeReport/ 已常被擋)
+    seen = {}
+    payload = {"stat": "OK", "tables": [
+        {"fields": ["證券代號", "收盤價"], "data": [["2330", "1005.00"]]}]}
+
+    def fake(url, **k):
+        seen["url"] = url
+        return payload
+    monkeypatch.setattr(mh, "get_json", fake)
+    quotes = mh.fetch_twse_day(date(2026, 6, 4))
+    assert "rwd/zh/afterTrading/MI_INDEX" in seen["url"]
+    assert [q.symbol for q in quotes] == ["2330"]
+
+
+def test_fetch_twse_day_falls_back_on_error(monkeypatch):
+    # 新端點連線失敗 -> 自動改用舊端點備援
+    payload = {"stat": "OK", "tables": [
+        {"fields": ["證券代號", "收盤價"], "data": [["2330", "1005.00"]]}]}
+    calls = []
+
+    def fake(url, **k):
+        calls.append(url)
+        if "rwd" in url:
+            raise RuntimeError("403 Forbidden")
+        return payload
+    monkeypatch.setattr(mh, "get_json", fake)
+    quotes = mh.fetch_twse_day(date(2026, 6, 4))
+    assert len(calls) == 2 and "exchangeReport" in calls[1]
+    assert [q.symbol for q in quotes] == ["2330"]
+
+
+def test_fetch_twse_day_all_endpoints_fail_raises(monkeypatch):
+    def boom(url, **k):
+        raise RuntimeError("連線失敗")
+    monkeypatch.setattr(mh, "get_json", boom)
+    try:
+        mh.fetch_twse_day(date(2026, 6, 4))
+        assert False, "全部端點失敗應丟例外"
+    except RuntimeError:
+        pass
+
+
 # ---- 上櫃 tradingStock (tables[0].data) 解析 (新版端點) ----------------
 def test_tpex_history_parses(monkeypatch):
     payload = {"tables": [{"data": [
@@ -90,12 +133,7 @@ def test_load_market_history_cache(monkeypatch):
         assert seen["n"] == n1        # 第二次走快取
 
 
-if __name__ == "__main__":
-    import pytest
-    raise SystemExit(pytest.main([__file__, "-q"]))
-
-
-# ---- (由 test_trend 移入) 上市逐檔 STOCK_DAY 解析 ----------------------
+# ---- 上市逐檔 STOCK_DAY 解析 ------------------------------------------
 def test_twse_history_parses(monkeypatch):
     from stock_quant.datasource.history import TwseHistoryDataSource
     payload = {"stat": "OK", "data": [
@@ -109,7 +147,7 @@ def test_twse_history_parses(monkeypatch):
     assert quotes[0].volume == 30000000          # 股 (×1)
 
 
-# ---- (由 test_trend 移入) universe 組裝 --------------------------------
+# ---- universe 組裝 -----------------------------------------------------
 def test_load_universe(monkeypatch):
     from stock_quant.datasource import twse as twse_mod
     from stock_quant.datasource import tpex as tpex_mod
@@ -124,3 +162,8 @@ def test_load_universe(monkeypatch):
     pairs = load_individual_universe(("twse", "tpex"))
     assert ("2330", Market.TWSE) in pairs and ("6488", Market.TPEX) in pairs
     assert all(sym != "0050" for sym, _ in pairs)
+
+
+if __name__ == "__main__":
+    import pytest
+    raise SystemExit(pytest.main([__file__, "-q"]))
