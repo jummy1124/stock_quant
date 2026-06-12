@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -14,7 +14,6 @@ env/
 *.sqlite3
 *.csv
 *.log
-ranking.xlsx
 
 # 環境變數 / 密鑰 (.env 內含 LINE token，切勿進 git；.env.example 為可分享範本)
 .env
@@ -27,4 +26,6 @@ ranking.xlsx
 .DS_Store
 Thumbs.db
 .cache/
-backtest_*.xlsx
+
+# 回測輸出報表 (涵蓋 ranking.xlsx 等所有 xlsx)
+*.xlsx
