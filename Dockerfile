@@ -25,9 +25,10 @@ COPY pyproject.toml poetry.lock* ./
 RUN if [ ! -f poetry.lock ]; then poetry lock; fi \
     && poetry install --only main --no-root
 
-# 複製原始碼後，把專案本身也裝進 venv (提供 `stock-quant` 指令)
+# 複製原始碼。容器以 `python run_intraday.py` 直接執行 (PYTHONPATH=/app 即可 import
+# stock_quant)，不需把專案本身裝進 venv；故不再 poetry install root，
+# 也避免 poetry 打包時讀 README 觸發編碼錯誤。相依已在上一步 (--no-root) 裝好。
 COPY . .
-RUN poetry install --only main
 
 ###############################################################################
 # Stage 2 — runtime：只帶 venv + 原始碼，體積小、無建置工具
