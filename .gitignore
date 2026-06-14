@@ -14,6 +14,7 @@ env/
 *.sqlite3
 *.csv
 *.log
+ranking.xlsx
 
 # 環境變數 / 密鑰 (.env 內含 LINE token，切勿進 git；.env.example 為可分享範本)
 .env
@@ -24,5 +25,4 @@ env/
 .vscode/
 .idea/
 .DS_Store
-Thumbs.db
-.cache/
+Thumbs

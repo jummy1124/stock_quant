@@ -160,14 +160,14 @@ def test_alerter_message_format():
 def test_digest_accumulates_then_fires_at_time():
     fn = _FakeNotifier()
     al = DailyDigestAlerter(fn, fire_time=time(12, 0), log=lambda m: None)
-    # 12:00 之前: 只累積、不推
+    # 13:00 之前: 只累積、不推
     assert al.process(datetime(2026, 6, 10, 10, 0), [_Row("2330", 5.0)]) == []
     assert al.process(datetime(2026, 6, 10, 11, 0), [_Row("1101", 3.5)]) == []
     assert fn.messages == []
-    # 到 12:00: 一次推完當天累積 (含這個 tick 的 2454)
+    # 到 13:00: 一次推完當天累積 (含這個 tick 的 2454)
     out = al.process(datetime(2026, 6, 10, 12, 0), [_Row("2454", 4.0)])
     assert set(out) == {"2330", "1101", "2454"} and len(fn.messages) == 1
-    # 12:00 之後: 當天已推，不再推
+    # 13:00 之後: 當天已推，不再推
     assert al.process(datetime(2026, 6, 10, 12, 1), [_Row("3008", 6.0)]) == []
     assert len(fn.messages) == 1
 

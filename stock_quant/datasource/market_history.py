@@ -5,10 +5,11 @@ TWSE MI_INDEX 對連續請求限流很嚴，觸發後會把 IP 擋上「好幾�
   * 每天之間留較大間隔 (delay 預設 3s)，盡量不要觸發限流。
   * 被擋時冷卻後重試 (cooldowns)；連續多天都被擋就「判定 IP 被鎖、停止抓取」，
     不再硬敲 (硬敲只會養大封鎖)。
-  * 逐日『增量快取 + 續抓』: 抓到的每個交易日存進快取；下次啟動只補「還沒抓到的日子」，
-    所以被擋而中斷時，過幾分鐘再跑就會接著補齊，最終仍能抓到全部。
+  * 逐日『增量快取 + 續抓』: 抓到的每個交易日存進快取；下次啟動由最新往回補「還沒抓到的日子」，
+    所以最後交易日永遠會被補上 (被擋而中斷時，過幾分鐘再跑就會接著補齊)。
 
-上櫃用「OTC 個股清單 + 逐檔抓歷史」(history.get_history，新版端點)，多進程加速、一併快取。
+上櫃用「OTC 個股清單 + 逐檔抓歷史」(history.get_history，新版端點)，多進程加速、一併快取;
+快取落後最新交易日時會重抓 (避免一直沿用舊資料)。
 回傳 {代號: 時間升冪日K序列}。
 """
 from __future__ import annotations
@@ -52,13 +53,15 @@ def _parse_mi_index(data, d: date) -> list[DailyQuote]:
         if "證券代號" not in idx or "收盤價" not in idx:
             continue
         ci, cli = idx["證券代號"], idx["收盤價"]
+        ni = idx.get("證券名稱")
         oi, hi, li = idx.get("開盤價"), idx.get("最高價"), idx.get("最低價")
         vi = idx.get("成交股數")
         for r in t.get("data", []):
             code = str(_g(r, ci) or "").strip()
             if not is_individual_stock(code):
                 continue
-            q = DailyQuote.normalize(symbol=code, name="", market=Market.TWSE, trade_date=d,
+            q = DailyQuote.normalize(symbol=code, name=str(_g(r, ni) or "").strip(),
+                                     market=Market.TWSE, trade_date=d,
                                      open=_g(r, oi), high=_g(r, hi), low=_g(r, li),
                                      close=_g(r, cli), volume=_g(r, vi))
             if q.is_valid():
@@ -162,17 +165,24 @@ def load_market_history(
         except Exception:
             pass
 
-    # 上市: 逐日整批 (增量續抓 + 限流退避)
+    # 上市: 逐日整批 (由最新往回，補齊「最近 days 個交易日」缺漏 + 限流退避)
+    #
+    # 重點: 由最新交易日往回掃，視窗內每遇到一個「還沒抓過」的交易日就補抓。
+    # 計數用「視窗內已確認有資料的交易日數 (seen)」而非「快取總天數」——
+    # 否則快取已累積很多天時會一啟動就 break，永遠抓不到最新一天 (最後交易日就會過時)。
     if "twse" in markets:
-        collected = len(twse_days)
-        if collected:
-            log(f"  [上市] 快取已有 {collected} 個交易日，續抓缺的 ...")
+        if twse_days:
+            log(f"  [上市] 快取已有 {len(twse_days)} 個交易日，補抓最新缺漏 ...")
         consecutive_fail = 0
+        seen = 0          # 由最新往回數，本視窗內已確認有資料的交易日數
+        fetched = 0       # 本次實際新抓到的交易日數 (僅供日誌)
         for d in _weekdays_back(today, max_attempts=days + 40):
-            if collected >= days:
+            if seen >= days:
                 break
             iso = d.isoformat()
-            if iso in twse_done:                      # 已抓過 -> 跳過 (續抓核心)
+            if iso in twse_done:                      # 已抓過 (含假日空白) -> 不重抓
+                if iso in twse_days:                  # 有資料才計入視窗
+                    seen += 1
                 continue
             rows: Optional[list[DailyQuote]] = None
             for attempt in range(len(cooldowns) + 1):
@@ -197,22 +207,38 @@ def load_market_history(
             twse_done.add(iso)
             if rows:
                 twse_days[iso] = rows
-                collected += 1
-                if collected == 1 or collected % 10 == 0:
-                    log(f"  [上市] 已抓 {collected}/{days} 個交易日 ...")
+                seen += 1
+                fetched += 1
+                if fetched == 1 or fetched % 10 == 0:
+                    log(f"  [上市] 已補抓 {fetched} 個交易日 (最新 {iso}) ...")
                 _save()                               # 邊抓邊存 -> 中斷也不白費
             if delay:
                 _time.sleep(delay)
-        if collected == 0:
+        if not twse_days:
             log("  [上市] 一天都沒抓到 -> 可能 IP 已被限流，請等幾分鐘再重跑 (會接續)。")
 
-    # 上櫃: OTC 清單 + 逐檔 (新版端點)，多進程加速；有快取就用快取
+    # 上櫃: OTC 清單 + 逐檔 (新版端點)，多進程加速;
+    # 快取「落後最新交易日」才重抓 (否則 6/10 之類的舊資料會一直被沿用、永遠不更新)。
     if "tpex" in markets:
-        if tpex_cache:
-            log(f"  [上櫃] 快取已有 {len(tpex_cache)} 檔，沿用。")
+        # 參考的「最後交易日」: 有上市資料時用上市最新日 (同一交易行事曆)；否則退而取最近一個平日
+        ref_latest = max(twse_days) if twse_days else None
+        if ref_latest is None:
+            wk = next(iter(_weekdays_back(today, 1)), None)
+            ref_latest = wk.isoformat() if wk else None
+        tpex_latest = None
+        for series in tpex_cache.values():
+            if series:
+                di = series[-1].trade_date.isoformat()
+                if tpex_latest is None or di > tpex_latest:
+                    tpex_latest = di
+        stale = ref_latest is not None and (tpex_latest is None or tpex_latest < ref_latest)
+        if tpex_cache and not stale:
+            log(f"  [上櫃] 快取已是最新 ({tpex_latest})，沿用 {len(tpex_cache)} 檔。")
         else:
+            if tpex_cache and stale:
+                log(f"  [上櫃] 快取最新 {tpex_latest} 落後 {ref_latest} -> 重抓最新歷史 ...")
             otc = _otc_universe(timeout=max(timeout, 20.0))
-            log(f"  [上櫃] 共 {len(otc)} 檔，逐檔抓歷史 (首次較久，會快取) ...")
+            log(f"  [上櫃] 共 {len(otc)} 檔，逐檔抓歷史 (首次/更新較久，會快取) ...")
             payloads = [(s, months) for s in otc]
             if payloads:
                 n = processes or min(len(payloads), 8)

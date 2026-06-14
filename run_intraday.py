@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""盤中選股: 盤中(09:00-13:30)每分鐘用即時價篩出符合 7 條規則的個股並 print (經穩定層確認)。
+"""盤中漲幅篩選: 盤中(09:00-13:30)每分鐘抓全市場即時價，篩出「漲幅 3% ~ 漲停前一檔」的個股，
+依漲幅由大到小排序，print 出來並寫進 Excel (預設 ranking.xlsx，每次覆蓋同一檔)。
 
-篩選規則 (BreakoutScreen，全符合才入選):
-  1. 紅K: 收盤 > 開盤
-  2. 漲幅 3% ~ 漲停前一檔
-  3. 上影線 ≤ 1%
-  4. 今日量 ≥ 1.2 × 昨日量 (盤中依已過時段比例換算為「同時段」量比)
-  5. 前一日收盤 < 五日均線(MA5)
-  6. 今日現價 > 昨日最高價
-  7. 多頭趨勢: 站上月線(MA20) + 月線≥季線(MA20≥MA60) + 頭頭高底底高 (擋空頭單日反彈)
+流程:
+  1. 啟動: 逐日整批抓全市場歷史日K (取昨收)，並建立 {代號:名稱} 對照表。
+  2. 每個 cycle: 抓今日K (交易時間=MIS 即時價 / 非交易時間=最後交易日完成日K)。
+  3. 對所有有報價的個股算漲幅% = (今收 − 昨收)/昨收 ×100。
+  4. 篩選: 漲幅 ≥ 3% 且 收盤 ≤ 漲停前一檔 (排除已鎖漲停)；依漲幅由大到小排序。
+  5. print 排行 (含股票名稱) + 覆蓋寫入 Excel。
 
 資料來源依時間自動切換: 交易時間抓 MIS 即時價當今日K；非交易時間改用最後一個交易日的
 完成日K (可用 --no-screen-when-closed 關閉、非盤中就純休眠)。
-穩定層: 即時價是「盤中瞬間值」，單次命中會跨分鐘跳動，故盤中需連續 N 次確認 + 寬限窗才報出
-(EOD 完成日K是定案資料，直接報出)。
-LINE 推播: --notify line 時推到 LINE。預設「每日 13:00 彙整一次」。
-⚠️ 技術面選股為機率性參考，非投資建議。
+LINE 推播: --notify line 時把符合的個股推到 LINE。預設「每日 13:00 彙整一次」。
+⚠️ 漲幅篩選為資訊參考，非投資建議。
 
 LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
     A. 專案根目錄放 .env 檔 (建議，已被 .gitignore 忽略):
@@ -24,10 +21,14 @@ LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
     B. 直接設環境變數 LINE_CHANNEL_TOKEN / LINE_USER_ID
 
 用法:
-    python run_intraday.py --notify line                  # 每日 13:00 彙整推播 (預設)
+    python run_intraday.py                                # 盤中每分鐘篩 3%~漲停前一檔 + 寫 ranking.xlsx
     python run_intraday.py --once                         # 立刻跑一次 (盤中=即時 / 非盤中=最後交易日)
-    python run_intraday.py --no-screen-when-closed        # 非交易時間純休眠，不用 EOD 資料
-    python run_intraday.py --no-trend                     # 關閉多頭趨勢閘門 (只跑原 6 條)
+    python run_intraday.py --min-change 5                 # 改成漲幅 ≥ 5%
+    python run_intraday.py --include-limit-up             # 連已鎖漲停的也納入
+    python run_intraday.py --no-filter                    # 不篩選，輸出全市場漲幅排行
+    python run_intraday.py --top 50                       # 畫面/LINE 只看前 50 名 (Excel 仍存全部)
+    python run_intraday.py --excel out/today.xlsx         # 自訂 Excel 路徑
+    python run_intraday.py --notify line                  # 每日 13:00 彙整推播
     python run_intraday.py 2330 2317                      # 只看指定個股
 
 """
@@ -38,14 +39,17 @@ import os
 import sys
 from datetime import datetime, time
 
-from stock_quant.analysis import BreakoutScreen
 from stock_quant.datasource import load_market_history
 from stock_quant.domain import Market
-from stock_quant.intraday import IntradayScreener
+from stock_quant.excel_export import save_ranking
+from stock_quant.intraday import IntradayRanker
 from stock_quant.notify import DailyDigestAlerter, LineNotifier, StableAlerter, load_dotenv
 from stock_quant.scheduler import MarketClock, run_market_loop
+from stock_quant.universe import load_name_map
 
-_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "history.pkl")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+_CACHE = os.path.join(_ROOT, ".cache", "history.pkl")
+_DEFAULT_XLSX = os.path.join(_ROOT, "ranking.xlsx")
 
 
 def _fmt(v):
@@ -58,28 +62,36 @@ def _parse_hhmm(s: str) -> time:
     return time(int(hh), int(mm))
 
 
-def _print_snapshot(now: datetime, rows, screener=None) -> None:
-    # 穩定層: 只報已「確認(stable)」的個股；非盤中 EOD 模式則直接是當日完成日K的命中
-    hits = [row for row in rows if row.stable]
-    quoted = len(rows)                                  # 本次可篩 (取得即時價 / EOD 可比) 的檔數
-    universe = len(screener.pairs) if screener is not None else quoted
-    src = getattr(screener, "last_source", "live") if screener is not None else "live"
+def _title(ranker) -> str:
+    if not ranker.apply_filter:
+        return "漲幅排行"
+    cap = "漲停前一檔" if ranker.exclude_limit_up else "漲停"
+    return f"漲幅篩選 ({ranker.min_change_pct:g}%~{cap})"
+
+
+def _print_ranking(now: datetime, rows, ranker=None, top: int = 0) -> None:
+    quotable = getattr(ranker, "last_quoted", len(rows)) if ranker is not None else len(rows)
+    universe = len(ranker.pairs) if ranker is not None else len(rows)
+    src = getattr(ranker, "last_source", "live") if ranker is not None else "live"
     tag = "盤中即時" if src == "live" else "最後交易日"
-    print(f"\n===== 選股快照 {now:%Y-%m-%d %H:%M:%S} [{tag}] — "
-          f"確認 {len(hits)} 檔 / 可篩 {quoted} 檔 / 全市場 {universe} 檔 =====")
-    if screener is not None and getattr(screener, "last_warning", None):
-        print(f"⚠️ {screener.last_warning} — 本次覆蓋不全，名單可能偏少")
-    if not hits:
+    title = _title(ranker) if ranker is not None else "漲幅排行"
+    print(f"\n===== {title} {now:%Y-%m-%d %H:%M:%S} [{tag}] — "
+          f"符合 {len(rows)} 檔 / 可算漲幅 {quotable} 檔 / 全市場 {universe} 檔 =====")
+    if ranker is not None and getattr(ranker, "last_warning", None):
+        print(f"⚠️ {ranker.last_warning} — 本次覆蓋不全，名單可能偏少")
+    if not rows:
         print("(目前沒有符合條件的個股)")
         return
-    header = f"{'代號':<8}{'市場':<6}{'收盤':>11}{'漲幅%':>9}{'上影線%':>11}{'量比':>11}"
+    shown = rows[:top] if top and top > 0 else rows
+    header = f"{'#':>4}  {'代號':<8}{'名稱':<12}{'市場':<6}{'現價':>10}{'漲跌':>9}{'漲幅%':>9}{'量(張)':>12}"
     print(header)
-    print("-" * len(header))
-    for row in sorted(hits, key=lambda x: -(x.result.change_pct or 0)):   # 依漲幅排序
-        r = row.result
-        vr = r.vol_pace_ratio if r.vol_pace_ratio is not None else r.vol_ratio
-        print(f"{row.symbol:<8}{row.market.zh:<6}{_fmt(r.close):>11}{_fmt(r.change_pct):>9}"
-              f"{_fmt(r.upper_shadow_pct):>11}{_fmt(vr):>11}")
+    print("-" * 74)
+    for i, r in enumerate(shown, start=1):
+        lots = "-" if r.lots is None else f"{r.lots:,.0f}"
+        print(f"{i:>4}  {r.symbol:<8}{(r.name or ''):<12}{r.market.zh:<6}"
+              f"{_fmt(r.close):>10}{_fmt(r.change):>9}{_fmt(r.change_pct):>9}{lots:>12}")
+    if top and top > 0 and len(rows) > top:
+        print(f"... (其餘 {len(rows) - top} 檔已寫入 Excel)")
 
 
 def _build_alerter(enabled: bool, mode: str, notify_time: time):
@@ -98,53 +110,73 @@ def _build_alerter(enabled: bool, mode: str, notify_time: time):
     return DailyDigestAlerter(notifier, fire_time=notify_time)
 
 
+def _load_names(market_arg: str) -> dict:
+    """建立 {代號: 名稱} 對照 (best-effort，失敗就回空字典)。"""
+    markets = ("twse", "tpex") if market_arg == "all" else (market_arg,)
+    try:
+        names = load_name_map(markets)
+        print(f"已建立股票名稱對照 {len(names)} 檔。")
+        return names
+    except Exception as exc:                       # noqa: BLE001 — 名稱對照失敗不致命
+        print(f"⚠️ 取股票名稱對照失敗: {exc} -> 改用資料源自帶名稱。")
+        return {}
+
+
 def main(argv=None) -> int:
     load_dotenv()        # 啟動先載入專案根目錄的 .env (不覆蓋已存在的環境變數)
-    parser = argparse.ArgumentParser(description="台股盤中選股 (7 規則 + 連續確認穩定層，multiprocess，每分鐘)")
+    parser = argparse.ArgumentParser(description="台股盤中漲幅篩選 (3%~漲停前一檔，multiprocess，每分鐘 print + 寫 Excel)")
     parser.add_argument("symbols", nargs="*", help="指定個股 (給了就覆蓋全市場)")
     parser.add_argument("--market", choices=["twse", "tpex", "all"], default="all")
-    parser.add_argument("--days", type=int, default=75, help="歷史交易日數 (全市場；需 ≥60 才能判多頭趨勢)")
-    parser.add_argument("--months", type=int, default=5, help="歷史月數 (指定個股)")
+    parser.add_argument("--days", type=int, default=5, help="歷史交易日數 (全市場；取昨收即可，預設 5)")
+    parser.add_argument("--months", type=int, default=1, help="歷史月數 (指定個股)")
     parser.add_argument("--interval", type=int, default=60, help="盤中更新間隔秒 (預設 60)")
     parser.add_argument("--idle-interval", type=int, default=300, help="非盤中(EOD模式)更新間隔秒 (預設 300)")
     parser.add_argument("--batch-size", type=int, default=40)
     parser.add_argument("--limit", type=int, default=0, help="最多看幾檔 (0=全部)")
     parser.add_argument("--procs", type=int, default=None)
-    parser.add_argument("--confirm-ticks", type=int, default=2,
-                        help="盤中需連續通過幾次 tick 才確認入選 (去雜訊，預設 2；1=不過濾)")
-    parser.add_argument("--grace-ticks", type=int, default=1,
-                        help="確認後即使瞬間不符仍保留幾次 (避免小跳動就消失，預設 1)")
-    parser.add_argument("--no-trend", action="store_true",
-                        help="關閉多頭趨勢閘門 (rule 7)，只跑原 6 條突破規則")
+    parser.add_argument("--min-change", type=float, default=3.0,
+                        help="篩選: 漲幅下限 %% (預設 3)")
+    parser.add_argument("--include-limit-up", action="store_true",
+                        help="連已鎖漲停 (收盤 > 漲停前一檔) 的也納入")
+    parser.add_argument("--no-filter", action="store_true",
+                        help="不篩選，輸出全市場漲幅排行")
+    parser.add_argument("--no-names", action="store_true",
+                        help="不建立股票名稱對照 (省一次 OpenAPI 請求)")
+    parser.add_argument("--top", type=int, default=0,
+                        help="畫面/LINE 只顯示漲幅前 N 名 (0=全部；Excel 一律存全部)")
+    parser.add_argument("--excel", default=_DEFAULT_XLSX,
+                        help=f"Excel 輸出路徑 (每次覆蓋；預設 {_DEFAULT_XLSX})")
+    parser.add_argument("--no-excel", action="store_true", help="不寫 Excel")
     parser.add_argument("--no-screen-when-closed", action="store_true",
                         help="非交易時間純休眠，不用最後交易日資料 (預設會用)")
     parser.add_argument("--notify", choices=["none", "line"], default="none",
-                        help="命中通知方式 (line 需設 LINE_CHANNEL_TOKEN / LINE_USER_ID)")
+                        help="符合個股通知方式 (line 需設 LINE_CHANNEL_TOKEN / LINE_USER_ID)")
     parser.add_argument("--notify-mode", choices=["daily", "realtime"], default="daily",
-                        help="LINE 推播模式: daily=每日定時彙整一次 (預設)；realtime=命中即時推")
+                        help="LINE 推播模式: daily=每日定時彙整一次 (預設)；realtime=每次更新就推")
     parser.add_argument("--notify-time", default="13:00",
                         help="daily 模式的推播時間 HH:MM (預設 13:00)")
+    parser.add_argument("--notify-top", type=int, default=0,
+                        help="LINE 推播的漲幅前 N 名 (0=全部符合的)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (盤中=即時 / 非盤中=最後交易日)")
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
     args = parser.parse_args(argv)
 
     market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
-    # --once 只跑一次，無法累積連續確認 -> 退回單次原始命中 (confirm=1)
-    confirm = 1 if args.once else args.confirm_ticks
-    screen = BreakoutScreen(require_uptrend=not args.no_trend)
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
     use_eod = not args.no_screen_when_closed       # 非交易時間是否用最後交易日資料
+    excel_path = None if args.no_excel else args.excel
+    name_map = {} if args.no_names else _load_names(args.market)
+    ranker_kw = dict(apply_filter=not args.no_filter, min_change_pct=args.min_change,
+                     exclude_limit_up=not args.include_limit_up, name_map=name_map,
+                     batch_size=args.batch_size, processes=args.procs, eod_when_closed=use_eod)
 
     if args.symbols:
         pairs = [(s, market) for s in args.symbols]
-        screener = IntradayScreener(pairs, months=args.months, screen=screen,
-                                    batch_size=args.batch_size, processes=args.procs,
-                                    confirm_ticks=confirm, grace_ticks=args.grace_ticks,
-                                    eod_when_closed=use_eod)
+        ranker = IntradayRanker(pairs, months=args.months, **ranker_kw)
         print(f"抓 {len(pairs)} 檔歷史日K (逐檔) ...")
-        ready = screener.prepare()
+        ready = ranker.prepare()
     else:
         markets = ("twse", "tpex") if args.market == "all" else (args.market,)
         print("逐日整批抓全市場歷史日K (對限流友善，當天會快取) ...")
@@ -154,24 +186,30 @@ def main(argv=None) -> int:
         if args.limit > 0:
             hist = dict(list(hist.items())[:args.limit])
         pairs = [(sym, series[-1].market) for sym, series in hist.items() if series]
-        screener = IntradayScreener(pairs, screen=screen,
-                                    batch_size=args.batch_size, processes=args.procs,
-                                    confirm_ticks=confirm, grace_ticks=args.grace_ticks,
-                                    eod_when_closed=use_eod)
-        ready = screener.preload_history(hist)
+        ranker = IntradayRanker(pairs, **ranker_kw)
+        ready = ranker.preload_history(hist)
 
-    trend_note = "關閉" if args.no_trend else "開啟"
+    filt = "關閉 (全市場排行)" if args.no_filter else _title(ranker)
     closed_note = "用最後交易日資料" if use_eod else "純休眠"
-    print(f"已備妥 {ready} 檔歷史。盤中每 {args.interval}s 篩選。多頭趨勢閘門: {trend_note}；非盤中: {closed_note}\n")
+    excel_note = "關閉" if excel_path is None else excel_path
+    print(f"已備妥 {ready} 檔歷史。盤中每 {args.interval}s 篩選 ({filt})。"
+          f"非盤中: {closed_note}；Excel: {excel_note}\n")
     if ready == 0:
         print("沒有歷史資料，請檢查網路或改用 --limit / 指定個股測試。")
         return 1
 
     def _cycle(now: datetime) -> None:
-        rows = screener.tick(now)
-        _print_snapshot(now, rows, screener)
+        rows = ranker.tick(now)
+        _print_ranking(now, rows, ranker, top=args.top)
+        if excel_path is not None and rows:
+            err = save_ranking(excel_path, now, rows, source=ranker.last_source, title=_title(ranker))
+            if err:
+                print(f"⚠️ {err}")
+            else:
+                print(f"💾 已寫入 Excel: {excel_path} ({len(rows)} 檔)")
         if alerter is not None:
-            pushed = alerter.process(now, rows)
+            top_rows = rows[:args.notify_top] if args.notify_top > 0 else rows
+            pushed = alerter.process(now, top_rows)
             if pushed:
                 print(f"📨 已推 LINE: {', '.join(pushed)}")
 
@@ -179,7 +217,7 @@ def main(argv=None) -> int:
         _cycle(datetime.now())
         return 0
 
-    print(f"進入常駐迴圈 (Ctrl+C 結束)；盤中需連續 {confirm} 次確認、寬限 {args.grace_ticks} 次 ...")
+    print(f"進入常駐迴圈 (Ctrl+C 結束)；每 {args.interval}s 更新一次 ...")
     try:
         run_market_loop(_cycle, clock=MarketClock(), interval=args.interval,
                         idle_interval=args.idle_interval, run_when_closed=use_eod,

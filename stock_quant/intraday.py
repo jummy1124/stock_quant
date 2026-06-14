@@ -1,11 +1,14 @@
-"""盤中選股: 每分鐘用即時價當「今日K」，套用 BreakoutScreen 篩出符合的個股。
+"""盤中漲幅排行 + 篩選: 每分鐘用即時價當「今日K」算漲幅，篩出「漲幅 3% ~ 漲停前一檔」的個股。
 
 歷史日K盤中不變 -> 啟動取得一次並快取;
 資料來源依時間自動切換:
-  - 交易時間 (09:00–13:30)：抓 MIS 即時價當「今日K」，與歷史(到昨日)比對。
-  - 非交易時間：用最後一個交易日的完成日K (history[-1]) 當「今日K」，與更早歷史比對。
+  - 交易時間 (09:00–13:30)：抓 MIS 即時價當「今日K」，與歷史(到昨日)比對算漲幅。
+  - 非交易時間：用最後一個交易日的完成日K (history[-1]) 當「今日K」，與更早一日比對。
 
-回傳 list[TickRow]，由 run_intraday 印出 stable 的個股 (已連續確認)。
+漲幅% = (今日收盤/現價 - 昨收) / 昨收 ×100。
+預設篩選: 漲幅 ≥ 3% 且 收盤 ≤ 漲停前一檔 (排除已鎖漲停)；結果依漲幅由大到小排序。
+回傳 list[RankRow]，由 run_intraday 印出並寫進 Excel。
+⚠️ 漲幅排行為資訊參考，非投資建議。
 """
 from __future__ import annotations
 
@@ -14,55 +17,56 @@ from datetime import datetime
 from multiprocessing import Pool
 from typing import Optional, Sequence
 
-from .analysis import BreakoutScreen, ScreenResult
 from .datasource import get_history
 from .datasource.mis import fetch_realtime
 from .domain import DailyQuote, Market
+from .limits import limit_up_prev_tick
 from .scheduler import MarketClock
 
 
+def _f(v) -> Optional[float]:
+    return float(v) if v is not None else None
+
+
 @dataclass(slots=True)
-class TickRow:
-    """一檔個股某次 tick 的結果。stable=True 才是「已確認、可下單參考」的訊號。"""
+class RankRow:
+    """一檔個股某次 tick 的漲幅排行列。"""
     symbol: str
+    name: str
     market: Market
-    result: ScreenResult
-    stable: bool = False
+    close: Optional[float]            # 今日收盤 / 盤中現價
+    prev_close: Optional[float]       # 昨收
+    change: Optional[float]           # 漲跌價 = 收 - 昨收
+    change_pct: Optional[float]       # 漲幅% = (收 - 昨收) / 昨收 ×100
+    volume: Optional[int]             # 成交股數 (本專案統一為「股」)
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
 
-    # 向後相容: 舊程式用 (symbol, market, result) 三元素解包仍可運作
+    @property
+    def lots(self) -> Optional[float]:
+        """成交量換算成「張」(1 張 = 1000 股)。"""
+        return None if self.volume is None else self.volume / 1000.0
+
+    @property
+    def result(self):
+        """向後相容: notify 的彙整推播讀 row.result.change_pct / row.result.close。"""
+        return self
+
+    @property
+    def stable(self) -> bool:
+        """漲幅排行無穩定層，每一列都是有效資料 (給 notify 沿用)。"""
+        return True
+
+    # 向後相容: 舊程式用 (symbol, market, row) 解包仍可運作
     def __iter__(self):
-        return iter((self.symbol, self.market, self.result))
+        return iter((self.symbol, self.market, self))
 
 
-class _Stabilizer:
-    """把單次 tick 的瞬間命中，過濾成「連續確認 + 寬限窗」的穩定訊號。
-
-    - confirm_ticks: 需連續通過幾次 tick 才『確認』入選 (去除單次雜訊)。
-    - grace_ticks  : 確認後即使某次瞬間不符，仍保留在清單幾次 (避免價格小幅跳動就消失)。
-    confirm_ticks≤1 時等於不過濾 (stable == 當下 passed)，給 --once / 單次測試用。
-    """
-
-    def __init__(self, confirm_ticks: int = 2, grace_ticks: int = 1):
-        self.confirm_ticks = confirm_ticks
-        self.grace_ticks = grace_ticks
-        self._streak: dict[str, int] = {}      # 連續通過次數
-        self._grace: dict[str, int] = {}       # 確認後剩餘寬限次數 (>0 表已確認且仍在清單)
-
-    def update(self, symbol: str, passed: bool) -> bool:
-        if self.confirm_ticks <= 1:
-            return passed
-        if passed:
-            self._streak[symbol] = self._streak.get(symbol, 0) + 1
-            if self._streak[symbol] >= self.confirm_ticks:
-                self._grace[symbol] = self.grace_ticks      # (重新)確認，補滿寬限
-                return True
-            return self._grace.get(symbol, 0) > 0            # 確認過且仍在寬限窗內
-        # 這次不符
-        self._streak[symbol] = 0
-        if self._grace.get(symbol, 0) > 0:
-            self._grace[symbol] -= 1                          # 消耗一次寬限，暫時保留
-            return True
-        return False
+def _change_pct(close: Optional[float], prev_close: Optional[float]) -> Optional[float]:
+    if close is None or not prev_close:
+        return None
+    return (close - prev_close) / prev_close * 100.0
 
 
 def _history_worker(payload):
@@ -73,23 +77,35 @@ def _history_worker(payload):
         return symbol, None, f"{type(exc).__name__}: {exc}"
 
 
-class IntradayScreener:
+class IntradayRanker:
+    """盤中漲幅排行 + 篩選引擎: 啟動載入歷史(取昨收)，每分鐘抓即時價算漲幅、篩選、排序。
+
+    篩選 (apply_filter=True 時):
+      - 漲幅 ≥ min_change_pct (預設 3%)
+      - exclude_limit_up=True 時，收盤 ≤ 漲停前一檔 (排除已鎖漲停)
+    name_map: {代號: 名稱}，用來補上輸出的股票名稱 (來源資料缺名稱時)。
+    """
+
     def __init__(self, pairs: Sequence[tuple[str, Optional[Market]]], months: int = 5,
                  batch_size: int = 40, processes: Optional[int] = None,
-                 screen: Optional[BreakoutScreen] = None,
-                 confirm_ticks: int = 2, grace_ticks: int = 1,
                  clock: Optional[MarketClock] = None,
-                 eod_when_closed: bool = True):
+                 eod_when_closed: bool = True,
+                 apply_filter: bool = True, min_change_pct: float = 3.0,
+                 exclude_limit_up: bool = True,
+                 name_map: Optional[dict[str, str]] = None):
         self.pairs = list(pairs)
         self.months = months
         self.batch_size = batch_size
         self.processes = processes
-        self.screen = screen or BreakoutScreen()
         self.clock = clock or MarketClock()
         self.eod_when_closed = eod_when_closed     # 非交易時間是否改用最後交易日完成日K
-        self._stab = _Stabilizer(confirm_ticks=confirm_ticks, grace_ticks=grace_ticks)
+        self.apply_filter = apply_filter
+        self.min_change_pct = min_change_pct
+        self.exclude_limit_up = exclude_limit_up
+        self.name_map = name_map or {}
         self._history: dict[str, list[DailyQuote]] = {}
-        self.last_quoted = 0          # 上次 tick 實際取得即時價/可篩的檔數 (覆蓋率診斷)
+        self.last_quoted = 0          # 上次 tick 實際取得即時價/可算漲幅的檔數 (覆蓋率診斷)
+        self.last_matched = 0         # 上次 tick 通過篩選的檔數
         self.last_warning: Optional[str] = None   # 上次 tick 的即時報價失敗摘要 (若有)
         self.last_source = "live"     # 上次 tick 的資料來源: "live" 盤中即時 / "eod" 最後交易日
 
@@ -109,17 +125,39 @@ class IntradayScreener:
                 self._history[symbol] = quotes
         return len(self._history)
 
-    def tick(self, now: Optional[datetime] = None) -> list[TickRow]:
-        """抓一次資料做選股篩選。交易時間用即時價；非交易時間用最後交易日完成日K。"""
+    def tick(self, now: Optional[datetime] = None) -> list[RankRow]:
+        """抓一次資料算漲幅、篩選、排序。交易時間用即時價；非交易時間用最後交易日完成日K。
+
+        回傳已依漲幅由大到小排序的 RankRow 清單。apply_filter=True 時只含「漲幅 3%~漲停前一檔」。
+        """
         now = now or datetime.now()
         if self.eod_when_closed and not self.clock.is_trading(now):
-            return self._tick_eod(now)
-        return self._tick_live(now)
+            rows = self._tick_eod(now)
+        else:
+            rows = self._tick_live(now)
+        if self.apply_filter:
+            rows = [r for r in rows if self._passes(r)]
+        self.last_matched = len(rows)
+        return self._sort(rows)
 
-    def _tick_live(self, now: datetime) -> list[TickRow]:
-        """交易時間: 抓即時價當今日K，套穩定層 (連續確認 + 寬限窗)。"""
+    def _passes(self, r: RankRow) -> bool:
+        """漲幅 ≥ min_change_pct 且 (可選) 收盤 ≤ 漲停前一檔。"""
+        if r.change_pct is None or r.change_pct < self.min_change_pct:
+            return False
+        if self.exclude_limit_up and r.prev_close and r.close is not None:
+            if r.close > limit_up_prev_tick(r.prev_close) + 1e-9:
+                return False
+        return True
+
+    @staticmethod
+    def _sort(rows: list[RankRow]) -> list[RankRow]:
+        # 依漲幅由大到小；None 視為最小，排在最後
+        return sorted(rows, key=lambda r: (r.change_pct is not None, r.change_pct or 0.0),
+                      reverse=True)
+
+    def _tick_live(self, now: datetime) -> list[RankRow]:
+        """交易時間: 抓即時價當今日K，與昨收算漲幅。"""
         self.last_source = "live"
-        frac = self.clock.session_fraction(now)         # 今日已過盤中比例 -> 量比同時段換算
         self.last_warning = None
 
         def _warn(msg: str) -> None:
@@ -128,34 +166,44 @@ class IntradayScreener:
                               processes=self.processes, on_error=_warn)
         live_by = {q.symbol: q for q in live}
         self.last_quoted = len(live_by)
-        out: list[TickRow] = []
+        out: list[RankRow] = []
         for symbol, market in self.pairs:
             hist = self._history.get(symbol)
             lq = live_by.get(symbol)
-            # 選股以「今日即時資料」為準: 沒歷史(無昨收)或這分鐘沒拿到即時價 -> 跳過
-            # 注意: 沒拿到即時價時也不更新穩定層 streak (避免覆蓋率波動誤判為「跌出」)
+            # 算漲幅需要「昨收(歷史)」與「今日現價(即時)」; 缺一就跳過
             if not hist or lq is None:
                 continue
-            res = self.screen.check(lq, hist, session_fraction=frac)   # 今日即時 vs 歷史(到昨日)
-            stable = self._stab.update(symbol, res.passed)
-            out.append(TickRow(symbol, lq.market, res, stable))
+            prev_close = _f(hist[-1].close)
+            close = _f(lq.close)
+            name = lq.name or hist[-1].name
+            out.append(self._row(symbol, lq.market, name, lq, prev_close, close))
         return out
 
-    def _tick_eod(self, now: datetime) -> list[TickRow]:
-        """非交易時間: 用最後一個交易日的完成日K (history[-1]) 當今日K，與更早歷史比對。
-
-        完成日K是定案資料、不會跨分鐘跳動，故不套穩定層 (stable 直接等於 passed)，
-        也不需抓網路 (純用啟動時快取的歷史)。
-        """
+    def _tick_eod(self, now: datetime) -> list[RankRow]:
+        """非交易時間: 用最後一個交易日的完成日K (history[-1])，與前一日算漲幅。"""
         self.last_source = "eod"
         self.last_warning = None
-        out: list[TickRow] = []
+        out: list[RankRow] = []
         for symbol, market in self.pairs:
             hist = self._history.get(symbol)
             if not hist or len(hist) < 2:               # 需至少「今日(最後交易日)+前一日」
                 continue
-            today = hist[-1]
-            res = self.screen.check(today, hist[:-1], session_fraction=1.0)   # 完整日K -> 量比看整日
-            out.append(TickRow(symbol, today.market, res, res.passed))
+            today, prev = hist[-1], hist[-2]
+            prev_close = _f(prev.close)
+            close = _f(today.close)
+            out.append(self._row(symbol, today.market, today.name, today, prev_close, close))
         self.last_quoted = len(out)
         return out
+
+    def _row(self, symbol: str, market: Market, name: str, q: DailyQuote,
+             prev_close: Optional[float], close: Optional[float]) -> RankRow:
+        cp = _change_pct(close, prev_close)
+        change = (close - prev_close) if (close is not None and prev_close is not None) else None
+        return RankRow(
+            symbol=symbol, name=self.name_map.get(symbol) or name or "", market=market,
+            close=close, prev_close=prev_close,
+            change=round(change, 2) if change is not None else None,
+            change_pct=round(cp, 2) if cp is not None else None,
+            volume=q.volume,
+            open=_f(q.open), high=_f(q.high), low=_f(q.low),
+        )

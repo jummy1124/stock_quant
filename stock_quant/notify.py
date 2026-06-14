@@ -4,7 +4,7 @@ LINE Notify 已於 2025/3/31 終止，改用 LINE 官方帳號的 Messaging API 
 零第三方依賴，用標準函式庫 urllib。
 
 兩種彙整推播模式:
-  - DailyDigestAlerter : 盤中累積所有確認個股，每天指定時間 (預設 12:00) 一次推完 (預設)。
+  - DailyDigestAlerter : 盤中累積所有確認個股，每天指定時間 (預設 13:00) 一次推完 (預設)。
   - StableAlerter      : 即時模式，個股一確認就推 (同一檔當天去重只推一次)。
 
 設定方式 (擇一即可；token 等同密碼，請勿寫進程式或 commit 進 git):
@@ -105,7 +105,7 @@ def _fmt_rows(head: str, rows: Sequence, empty_note: str) -> str:
 
 
 class DailyDigestAlerter:
-    """盤中持續累積『已確認(stable)』個股，每天指定時間 (預設 12:00) 一次推完。
+    """盤中持續累積『已確認(stable)』個股，每天指定時間 (預設 13:00) 一次推完。
 
     - 到了 fire_time 的第一個 tick，把當天累積到的所有個股彙整成一則推出，當天就不再推。
     - 即使當天沒有任何符合，也會在 fire_time 推一則「今日尚無符合」(讓你確認系統有在跑)。

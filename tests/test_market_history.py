@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 import sys
 import tempfile
 from datetime import date
@@ -130,7 +131,56 @@ def test_load_market_history_cache(monkeypatch):
         mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 8))
         n1 = seen["n"]
         mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 8))
-        assert seen["n"] == n1        # 第二次走快取
+        assert seen["n"] == n1        # 第二次 (同一天) 走快取、不重抓
+
+
+# ---- 回歸: 快取已滿但缺最新一天時，仍要補抓最新交易日 -------------------
+def test_load_market_history_fetches_newest_missing_day(monkeypatch):
+    fetched = []
+
+    def fake_twse(d, timeout=10.0):
+        fetched.append(d)
+        return [mh.DailyQuote.normalize(symbol="2330", name="", market=Market.TWSE,
+                                        trade_date=d, open=1, high=1, low=1, close=float(d.day))]
+    monkeypatch.setattr(mh, "fetch_twse_day", fake_twse)
+    with tempfile.TemporaryDirectory() as d:
+        cache = os.path.join(d, "h.pkl")
+        # 先用較早的 today 建快取 (Jun 5 -> 抓 Jun4,Jun3,Jun2)
+        mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 5))
+        fetched.clear()
+        # 隔幾天再跑 (Jun 9): 視窗 Jun8,Jun5,Jun4 -> Jun8/Jun5 未抓過 -> 補抓最新
+        hist = mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 9))
+        assert date(2026, 6, 8) in fetched                            # 有補到最新一天
+        assert max(q.trade_date for q in hist["2330"]) == date(2026, 6, 8)   # 最後交易日已更新
+
+
+# ---- 回歸: 上櫃快取落後最新交易日時要重抓 ------------------------------
+def test_load_market_history_tpex_refetches_when_stale(monkeypatch):
+    monkeypatch.setattr(mh, "_otc_universe", lambda timeout=20.0: ["6488"])
+    calls = {"n": 0}
+
+    def fake_get_history(symbol, market=None, months=5):
+        calls["n"] += 1
+        return [mh.DailyQuote.normalize(symbol=symbol, name="", market=Market.TPEX,
+                                        trade_date=date(2026, 6, 8), open=1, high=1, low=1, close=1)]
+    monkeypatch.setattr(hist_mod, "get_history", fake_get_history)
+
+    def fake_twse(d, timeout=10.0):
+        return [mh.DailyQuote.normalize(symbol="2330", name="", market=Market.TWSE,
+                                        trade_date=d, open=1, high=1, low=1, close=1)]
+    monkeypatch.setattr(mh, "fetch_twse_day", fake_twse)
+
+    with tempfile.TemporaryDirectory() as dd:
+        cache = os.path.join(dd, "h.pkl")
+        old = [mh.DailyQuote.normalize(symbol="6488", name="", market=Market.TPEX,
+                                       trade_date=date(2026, 6, 3), open=1, high=1, low=1, close=1)]
+        with open(cache, "wb") as f:           # 預先放一份「落後到 6/3」的上櫃快取
+            pickle.dump({"ver": mh._CACHE_VERSION, "twse_days": {}, "twse_done": [],
+                         "tpex": {"6488": old}}, f)
+        hist = mh.load_market_history(("twse", "tpex"), days=3, delay=0, processes=1,
+                                      cache_path=cache, today=date(2026, 6, 9))
+        assert calls["n"] >= 1                                        # 落後 -> 有重抓上櫃
+        assert max(q.trade_date for q in hist["6488"]) == date(2026, 6, 8)
 
 
 # ---- 上市逐檔 STOCK_DAY 解析 ------------------------------------------
