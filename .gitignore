@@ -25,4 +25,6 @@ ranking.xlsx
 .vscode/
 .idea/
 .DS_Store
-Thumbs
+Thumbs.db
+.cache/
+backtest_*.xlsx

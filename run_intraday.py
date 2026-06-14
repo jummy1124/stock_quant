@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""盤中漲幅篩選: 盤中(09:00-13:30)每分鐘抓全市場即時價，篩出「漲幅 3% ~ 漲停前一檔」的個股，
-依漲幅由大到小排序，print 出來並寫進 Excel (預設 ranking.xlsx，每次覆蓋同一檔)。
+"""盤中起漲篩選: 盤中(09:00-13:30)每分鐘抓全市場即時價，先篩出「漲幅 3% ~ 漲停前一檔」的個股池，
+再用起漲點 6 條件篩出當日起漲個股，print 出來並寫進 Excel (漲幅池預設覆蓋 ranking.xlsx)。
 
 流程:
-  1. 啟動: 逐日整批抓全市場歷史日K (取昨收)，並建立 {代號:名稱} 對照表。
+  1. 啟動: 逐日整批抓全市場歷史日K (取昨收+均線)，並建立 {代號:名稱} 對照表。
   2. 每個 cycle: 抓今日K (交易時間=MIS 即時價 / 非交易時間=最後交易日完成日K)。
-  3. 對所有有報價的個股算漲幅% = (今收 − 昨收)/昨收 ×100。
-  4. 篩選: 漲幅 ≥ 3% 且 收盤 ≤ 漲停前一檔 (排除已鎖漲停)；依漲幅由大到小排序。
-  5. print 排行 (含股票名稱) + 覆蓋寫入 Excel。
+  3. 第一層: 對所有有報價的個股算漲幅%，篩 3% ~ 漲停前一檔，依漲幅排序。
+  4. 第二層 (預設開啟): 起漲點 6 條件 — 紅K、突破昨高、量增 1.2 倍、站上 5MA、
+     站上月線且月線上彎、昨日仍在 5MA 下；通過者依強度分排序並印出。
+  5. 漲幅池覆蓋寫入 Excel；--notify line 時把起漲個股推到 LINE。
 
 資料來源依時間自動切換: 交易時間抓 MIS 即時價當今日K；非交易時間改用最後一個交易日的
 完成日K (可用 --no-screen-when-closed 關閉、非盤中就純休眠)。
-LINE 推播: --notify line 時把符合的個股推到 LINE。預設「每日 13:00 彙整一次」。
-⚠️ 漲幅篩選為資訊參考，非投資建議。
+⚠️ 篩選為資訊參考，非投資建議。
 
 LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
     A. 專案根目錄放 .env 檔 (建議，已被 .gitignore 忽略):
@@ -21,14 +21,13 @@ LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
     B. 直接設環境變數 LINE_CHANNEL_TOKEN / LINE_USER_ID
 
 用法:
-    python run_intraday.py                                # 盤中每分鐘篩 3%~漲停前一檔 + 寫 ranking.xlsx
+    python run_intraday.py                                # 盤中每分鐘篩起漲個股 + 寫 ranking.xlsx
     python run_intraday.py --once                         # 立刻跑一次 (盤中=即時 / 非盤中=最後交易日)
-    python run_intraday.py --min-change 5                 # 改成漲幅 ≥ 5%
-    python run_intraday.py --include-limit-up             # 連已鎖漲停的也納入
-    python run_intraday.py --no-filter                    # 不篩選，輸出全市場漲幅排行
-    python run_intraday.py --top 50                       # 畫面/LINE 只看前 50 名 (Excel 仍存全部)
-    python run_intraday.py --excel out/today.xlsx         # 自訂 Excel 路徑
-    python run_intraday.py --notify line                  # 每日 13:00 彙整推播
+    python run_intraday.py --no-breakout                  # 關起漲篩選，改印全部漲幅排行 (3%~漲停前)
+    python run_intraday.py --show-pool                    # 同時印第一層漲幅池完整排行
+    python run_intraday.py --breakout-vol-projection      # 條件3 改用全日預估量比昨量 (早盤較公允)
+    python run_intraday.py --breakout-excel out/brk.xlsx  # 起漲結果另存 Excel
+    python run_intraday.py --notify line                  # 每日 13:00 彙整推播起漲個股
     python run_intraday.py 2330 2317                      # 只看指定個股
 
 """
@@ -39,6 +38,7 @@ import os
 import sys
 from datetime import datetime, time
 
+from stock_quant.breakout_screen import BreakoutConfig, save_breakout, screen_breakout
 from stock_quant.datasource import load_market_history
 from stock_quant.domain import Market
 from stock_quant.excel_export import save_ranking
@@ -94,6 +94,30 @@ def _print_ranking(now: datetime, rows, ranker=None, top: int = 0) -> None:
         print(f"... (其餘 {len(rows) - top} 檔已寫入 Excel)")
 
 
+def _print_breakout(now: datetime, scored, source: str = "live", top: int = 0,
+                    pool: int = None) -> None:
+    """印出第二層『起漲點』篩選結果 (6 條件，依強度分排序)。"""
+    tag = "盤中即時" if source == "live" else "最後交易日"
+    pool_note = f"漲幅池 {pool} 檔 → " if pool is not None else ""
+    print(f"\n===== 起漲個股 (紅K+突破昨高+量增+站上5MA+月線上彎+昨日在5MA下) {now:%Y-%m-%d %H:%M:%S} [{tag}] — "
+          f"{pool_note}篩出 {len(scored)} 檔 =====")
+    if not scored:
+        print("(目前沒有符合起漲條件的個股)")
+        return
+    shown = scored[:top] if top and top > 0 else scored
+    header = f"{'#':>4}  {'代號':<8}{'名稱':<12}{'現價':>10}{'漲幅%':>9}{'昨高':>10}{'量比':>7}{'強度分':>8}  理由"
+    print(header)
+    print("-" * 92)
+    for i, sr in enumerate(shown, start=1):
+        r = sr.row
+        vr = "-" if sr.vol_ratio is None else f"{sr.vol_ratio:.2f}"
+        print(f"{i:>4}  {r.symbol:<8}{(r.name or ''):<12}{_fmt(r.close):>10}"
+              f"{_fmt(r.change_pct):>9}{_fmt(sr.prev_high):>10}{vr:>7}{sr.score:>8.1f}  "
+              f"{' / '.join(sr.reasons)}")
+    if top and top > 0 and len(scored) > top:
+        print(f"... (其餘 {len(scored) - top} 檔已寫入 Excel)")
+
+
 def _build_alerter(enabled: bool, mode: str, notify_time: time):
     """--notify line 時建立推播器；未設 .env/環境變數則停用並提示。"""
     if not enabled:
@@ -124,11 +148,13 @@ def _load_names(market_arg: str) -> dict:
 
 def main(argv=None) -> int:
     load_dotenv()        # 啟動先載入專案根目錄的 .env (不覆蓋已存在的環境變數)
-    parser = argparse.ArgumentParser(description="台股盤中漲幅篩選 (3%~漲停前一檔，multiprocess，每分鐘 print + 寫 Excel)")
+    parser = argparse.ArgumentParser(description="台股盤中起漲篩選 (3%~漲停前一檔漲幅池 + 起漲點 6 條件，每分鐘 print + 寫 Excel)")
     parser.add_argument("symbols", nargs="*", help="指定個股 (給了就覆蓋全市場)")
     parser.add_argument("--market", choices=["twse", "tpex", "all"], default="all")
-    parser.add_argument("--days", type=int, default=5, help="歷史交易日數 (全市場；取昨收即可，預設 5)")
-    parser.add_argument("--months", type=int, default=1, help="歷史月數 (指定個股)")
+    parser.add_argument("--days", type=int, default=35,
+                        help="歷史交易日數 (全市場；需 ≥25 才能算 5/20 日均線及月線斜率，預設 35；起漲篩選會自動確保 ≥30)")
+    parser.add_argument("--months", type=int, default=2,
+                        help="歷史月數 (指定個股；需 ≥2 才能算月均線，預設 2)")
     parser.add_argument("--interval", type=int, default=60, help="盤中更新間隔秒 (預設 60)")
     parser.add_argument("--idle-interval", type=int, default=300, help="非盤中(EOD模式)更新間隔秒 (預設 300)")
     parser.add_argument("--batch-size", type=int, default=40)
@@ -156,7 +182,22 @@ def main(argv=None) -> int:
     parser.add_argument("--notify-time", default="13:00",
                         help="daily 模式的推播時間 HH:MM (預設 13:00)")
     parser.add_argument("--notify-top", type=int, default=0,
-                        help="LINE 推播的漲幅前 N 名 (0=全部符合的)")
+                        help="LINE 推播的前 N 名 (0=全部符合的)")
+    # --- 第二層 起漲點篩選 (6 條件)；預設開啟，畫面直接印「已篩出起漲的個股」 ---
+    parser.add_argument("--no-breakout", action="store_true",
+                        help="關閉起漲點篩選，改回印全部漲幅排行 (3%%~漲停前)")
+    parser.add_argument("--show-pool", action="store_true",
+                        help="同時印出第一層漲幅池完整排行 (預設只印一行摘要)")
+    parser.add_argument("--breakout-top", type=int, default=0,
+                        help="畫面只顯示強度分前 N 名 (0=全部；Excel 一律存全部)")
+    parser.add_argument("--breakout-excel", default=None,
+                        help="起漲篩選結果另存 Excel 路徑 (預設不另存)")
+    parser.add_argument("--breakout-min-score", type=float, default=0.0,
+                        help="強度分下限，低於不輸出 (預設 0=只要 6 條件通過就列)")
+    parser.add_argument("--breakout-vol-ratio", type=float, default=1.2,
+                        help="條件3: 當日量 / 昨量 下限 (預設 1.2 倍)")
+    parser.add_argument("--breakout-vol-projection", action="store_true",
+                        help="條件3 改用『全日預估量』比昨量 (盤中早盤較公允；預設用當日累積量直接比)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (盤中=即時 / 非盤中=最後交易日)")
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
@@ -168,6 +209,18 @@ def main(argv=None) -> int:
     use_eod = not args.no_screen_when_closed       # 非交易時間是否用最後交易日資料
     excel_path = None if args.no_excel else args.excel
     name_map = {} if args.no_names else _load_names(args.market)
+    brk_cfg = None if args.no_breakout else BreakoutConfig(
+        vol_ratio_min=args.breakout_vol_ratio,
+        use_volume_projection=args.breakout_vol_projection,
+        min_score=args.breakout_min_score)
+    # 起漲篩選啟用時，自動確保歷史足以算 5/20 日均線與月線斜率，使用者不必另外帶 --days/--months
+    if brk_cfg is not None:
+        if args.days < 30:
+            print(f"ℹ️ 起漲篩選需月均線及斜率，--days {args.days} 自動拉到 30。")
+            args.days = 30
+        if args.months < 2:
+            print(f"ℹ️ 起漲篩選需月均線，--months {args.months} 自動拉到 2。")
+            args.months = 2
     ranker_kw = dict(apply_filter=not args.no_filter, min_change_pct=args.min_change,
                      exclude_limit_up=not args.include_limit_up, name_map=name_map,
                      batch_size=args.batch_size, processes=args.procs, eod_when_closed=use_eod)
@@ -194,13 +247,31 @@ def main(argv=None) -> int:
     excel_note = "關閉" if excel_path is None else excel_path
     print(f"已備妥 {ready} 檔歷史。盤中每 {args.interval}s 篩選 ({filt})。"
           f"非盤中: {closed_note}；Excel: {excel_note}\n")
+    if brk_cfg is not None:
+        hist_n = args.months * 20 if args.symbols else args.days
+        print("✅ 畫面顯示『已篩出起漲的個股』(紅K+突破昨高+量增1.2倍+站上5MA+月線上彎+昨日在5MA下)；"
+              "漲幅池只印摘要 (--show-pool 看全表，--no-breakout 關閉)。")
+        print(f"   均線條件已自動帶入 (歷史約 {hist_n} 根，足以算 5/20MA 及月線斜率)。\n")
     if ready == 0:
         print("沒有歷史資料，請檢查網路或改用 --limit / 指定個股測試。")
         return 1
 
     def _cycle(now: datetime) -> None:
         rows = ranker.tick(now)
-        _print_ranking(now, rows, ranker, top=args.top)
+        scored = None
+        # 預設: 畫面直接印「已篩出起漲的個股」(第二層)；漲幅池只留一行摘要 (--show-pool 可印全表)
+        if brk_cfg is not None:
+            if args.show_pool:
+                _print_ranking(now, rows, ranker, top=args.top)
+            scored = screen_breakout(ranker, rows, now, brk_cfg)
+            _print_breakout(now, scored, source=ranker.last_source, top=args.breakout_top,
+                            pool=len(rows))
+            if args.breakout_excel and scored:
+                berr = save_breakout(args.breakout_excel, now, scored, source=ranker.last_source)
+                print(f"⚠️ {berr}" if berr else f"💾 已寫入起漲 Excel: {args.breakout_excel} ({len(scored)} 檔)")
+        else:
+            _print_ranking(now, rows, ranker, top=args.top)
+        # Excel 仍存第一層完整漲幅排行 (不受畫面顯示影響)
         if excel_path is not None and rows:
             err = save_ranking(excel_path, now, rows, source=ranker.last_source, title=_title(ranker))
             if err:
@@ -208,7 +279,9 @@ def main(argv=None) -> int:
             else:
                 print(f"💾 已寫入 Excel: {excel_path} ({len(rows)} 檔)")
         if alerter is not None:
-            top_rows = rows[:args.notify_top] if args.notify_top > 0 else rows
+            # 起漲篩選啟用時只推「起漲個股」(scored)，否則推漲幅池
+            push_src = [s.row for s in scored] if scored is not None else rows
+            top_rows = push_src[:args.notify_top] if args.notify_top > 0 else push_src
             pushed = alerter.process(now, top_rows)
             if pushed:
                 print(f"📨 已推 LINE: {', '.join(pushed)}")

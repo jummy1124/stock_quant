@@ -113,6 +113,10 @@ class IntradayRanker:
         self._history = {s: q for s, q in hist_map.items() if q}
         return len(self._history)
 
+    def history(self, symbol: str) -> list[DailyQuote]:
+        """取某代號的歷史日K (由舊到新)；給下游起漲篩選算均線/昨高/昨量用。"""
+        return self._history.get(symbol, [])
+
     def prepare(self) -> int:
         payloads = [(s, m, self.months) for s, m in self.pairs]
         if len(payloads) <= 1 or self.processes == 1:

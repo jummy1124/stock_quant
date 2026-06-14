@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import date, datetime, time
+from datetime import datetime, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
