@@ -1,0 +1,25 @@
+services:
+  stock-quant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stock-quant:latest
+    container_name: stock-quant
+    # 容器內時間判斷用台北時區 (Dockerfile 已設 TZ，這裡再次明示)
+    environment:
+      TZ: Asia/Taipei
+    # LINE 推播等密鑰從 .env 載入 (複製 .env.example;此檔不進 git)
+    env_file:
+      - .env
+    volumes:
+      # 歷史日K 快取持久化 (named volume，避免每次啟動重抓全市場)
+      - stock-cache:/app/.cache
+      # Excel 輸出落到主機 ./data，方便在主機端開啟 ranking.xlsx
+      - ./data:/app/data
+    # 預設常駐每分鐘篩選，盤中即時 / 非盤中用最後交易日；Excel 寫到 /app/data。
+    # 要每日 13:00 LINE 推播改成: ["--excel","/app/data/ranking.xlsx","--notify","line"]
+    command: ["--excel", "/app/data/ranking.xlsx"]
+    restart: unless-stopped
+
+volumes:
+  stock-cache:

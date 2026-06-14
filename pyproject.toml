@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "stock-quant"
+version = "0.1.0"
+description = "台股盤中漲幅 / 起漲點篩選 — 盤中即時 + 盤後 EOD 自動切換，輸出 Excel 並可 LINE 推播"
+authors = ["Vincent <jummy1124@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+packages = [
+    { include = "stock_quant" },
+    { include = "run_intraday.py" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+openpyxl = "^3.1.5"
+
+[tool.poetry.group.dev.dependencies]
+# 測試僅用標準函式庫 (tests/run_tests.py)，不需額外套件。
+# 之後若導入 pytest / ruff，可加在這一組。
+
+[tool.poetry.scripts]
+# 安裝後可直接用 `stock-quant ...` 取代 `python run_intraday.py ...`
+stock-quant = "run_intraday:main"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"

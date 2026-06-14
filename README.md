@@ -1,5 +1,7 @@
 # stock_quant — 台股盤中漲幅篩選 (盤中即時 + 盤後)
 
+> 🐳 **部署**：用 Poetry 管環境、Docker 打包。`cp .env.example .env` 後 `docker compose up -d --build` 即可。詳見 [`DEPLOY.md`](DEPLOY.md)。
+
 物件導向、分層、依賴反轉。**篩出「漲幅 3% ~ 漲停前一檔」的個股**，依漲幅由大到小排序，
 多進程平行抓即時價。只看普通個股（ETF/權證/特別股/期貨等濾掉）。單一進入點 `run_intraday.py`：
 
@@ -83,12 +85,4 @@ stock_market/
 │   ├── intraday.py           # 漲幅排行/篩選引擎 IntradayRanker (盤中即時/盤後EOD 自動切換)
 │   ├── excel_export.py       # 把結果寫進 .xlsx (openpyxl)
 │   ├── notify.py             # LINE 推播 + 每日彙整 / 即時彙整 + .env 載入
-│   └── scheduler.py          # 盤中時段判斷 + 常駐迴圈
-└── tests/                    # 不需網路的單元測試 (53/53 通過)
-```
-
-## 執行測試
-
-```bash
-python tests/run_tests.py
-```
+│   └── scheduler.py          # 盤中時段�

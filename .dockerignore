@@ -1,0 +1,33 @@
+# 版控 / 編輯器
+.git
+.gitignore
+.vscode
+.idea
+
+# Python 快取與虛擬環境 (映像在 builder 階段自行建立 .venv)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 本機資料 / 輸出 (容器內以 volume 提供)
+.cache/
+data/
+ranking.xlsx
+backtest_*.xlsx
+*.log
+*.csv
+*.db
+*.sqlite3
+
+# 密鑰：.env 由 compose 的 env_file 在執行階段注入，不烤進映像
+.env
+.env.*
+!.env.example
+
+# 文件 / 既有部署目錄
+deploy/
+*.md
+!README.md
