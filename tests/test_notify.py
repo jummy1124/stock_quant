@@ -15,8 +15,9 @@ from stock_quant.notify import DailyDigestAlerter, LineNotifier, StableAlerter, 
 
 class _Row:
     """模擬 intraday.TickRow 的最小介面。"""
-    def __init__(self, symbol, change_pct, close=10.0, stable=True, zh="上市"):
+    def __init__(self, symbol, change_pct, close=10.0, stable=True, zh="上市", name="某股"):
         self.symbol = symbol
+        self.name = name
         self.stable = stable
         self.market = type("M", (), {"zh": zh})()
         self.result = type("R", (), {"change_pct": change_pct, "close": close})()
@@ -151,23 +152,24 @@ def test_alerter_push_failure_not_marked():
 def test_alerter_message_format():
     fn = _FakeNotifier()
     al = StableAlerter(fn, log=lambda m: None)
-    al.process(datetime(2026, 6, 10, 10, 30, 5), [_Row("2330", 5.12, close=1005)])
+    al.process(datetime(2026, 6, 10, 10, 30, 5), [_Row("2330", 5.12, close=1005, name="台積電")])
     msg = fn.messages[0]
-    assert "2330" in msg and "5.12" in msg and "非投資建議" in msg
+    assert all(x in msg for x in ("2330", "台積電", "1005", "5.12", "非投資建議"))
 
 
 # ---- DailyDigestAlerter 每日定時彙整 ----------------------------------
-def test_digest_accumulates_then_fires_at_time():
+def test_digest_fires_snapshot_at_time():
     fn = _FakeNotifier()
     al = DailyDigestAlerter(fn, fire_time=time(12, 0), log=lambda m: None)
-    # 13:00 之前: 只累積、不推
+    # fire_time 之前: 不推 (也不累積先前 tick)
     assert al.process(datetime(2026, 6, 10, 10, 0), [_Row("2330", 5.0)]) == []
     assert al.process(datetime(2026, 6, 10, 11, 0), [_Row("1101", 3.5)]) == []
     assert fn.messages == []
-    # 到 13:00: 一次推完當天累積 (含這個 tick 的 2454)
+    # 到 fire_time: 只推「當下這個 tick」的個股 (快照, 不含先前 tick 的 2330/1101)
     out = al.process(datetime(2026, 6, 10, 12, 0), [_Row("2454", 4.0)])
-    assert set(out) == {"2330", "1101", "2454"} and len(fn.messages) == 1
-    # 13:00 之後: 當天已推，不再推
+    assert out == ["2454"] and len(fn.messages) == 1
+    assert "2330" not in fn.messages[0] and "1101" not in fn.messages[0]
+    # fire_time 之後: 當天已推，不再推
     assert al.process(datetime(2026, 6, 10, 12, 1), [_Row("3008", 6.0)]) == []
     assert len(fn.messages) == 1
 

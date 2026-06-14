@@ -27,7 +27,7 @@ LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
     python run_intraday.py --show-pool                    # 同時印第一層漲幅池完整排行
     python run_intraday.py --breakout-vol-projection      # 條件3 改用全日預估量比昨量 (早盤較公允)
     python run_intraday.py --breakout-excel out/brk.xlsx  # 起漲結果另存 Excel
-    python run_intraday.py --notify line                  # 每日 13:00 彙整推播起漲個股
+    python run_intraday.py --notify line                  # 每日 13:00 推當下起漲個股快照
     python run_intraday.py 2330 2317                      # 只看指定個股
 
 """
@@ -130,7 +130,7 @@ def _build_alerter(enabled: bool, mode: str, notify_time: time):
     if mode == "realtime":
         print(f"LINE 推播: 即時模式 (收訊者 {len(notifier.user_ids)} 人)")
         return StableAlerter(notifier)
-    print(f"LINE 推播: 每日 {notify_time:%H:%M} 彙整一次 (收訊者 {len(notifier.user_ids)} 人)")
+    print(f"LINE 推播: 每日 {notify_time:%H:%M} 推當下篩選快照 (收訊者 {len(notifier.user_ids)} 人)")
     return DailyDigestAlerter(notifier, fire_time=notify_time)
 
 
@@ -178,7 +178,7 @@ def main(argv=None) -> int:
     parser.add_argument("--notify", choices=["none", "line"], default="none",
                         help="符合個股通知方式 (line 需設 LINE_CHANNEL_TOKEN / LINE_USER_ID)")
     parser.add_argument("--notify-mode", choices=["daily", "realtime"], default="daily",
-                        help="LINE 推播模式: daily=每日定時彙整一次 (預設)；realtime=每次更新就推")
+                        help="LINE 推播模式: daily=每日定時推當下篩選快照 (預設)；realtime=每次更新就推")
     parser.add_argument("--notify-time", default="13:00",
                         help="daily 模式的推播時間 HH:MM (預設 13:00)")
     parser.add_argument("--notify-top", type=int, default=0,

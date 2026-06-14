@@ -99,16 +99,17 @@ def _fmt_rows(head: str, rows: Sequence, empty_note: str) -> str:
         res = r.result
         cp = "-" if res.change_pct is None else f"{res.change_pct:.2f}"
         cl = "-" if res.close is None else f"{res.close:g}"
-        lines.append(f"{r.symbol} {r.market.zh}　收 {cl}　漲 {cp}%")
+        name = getattr(r, "name", "") or ""
+        lines.append(f"{r.symbol} {name}　收 {cl}　漲 {cp}%")
     lines.append("⚠️ 技術面參考，非投資建議")
     return "\n".join(lines)
 
 
 class DailyDigestAlerter:
-    """盤中持續累積『已確認(stable)』個股，每天指定時間 (預設 13:00) 一次推完。
+    """每天到指定時間 (預設 13:00) 的第一個 tick，推『當下』通過篩選的個股快照 (非累積)。
 
-    - 到了 fire_time 的第一個 tick，把當天累積到的所有個股彙整成一則推出，當天就不再推。
-    - 即使當天沒有任何符合，也會在 fire_time 推一則「今日尚無符合」(讓你確認系統有在跑)。
+    - 到 fire_time 前不推；到點的第一個 tick 把「當下這個 tick 符合」的個股一次推完，當天不再推。
+    - 即使當下沒有任何符合，也會在 fire_time 推一則「今日尚無符合」(讓你確認系統有在跑)。
     - 跨交易日自動重置。推播失敗不標記已送 -> 下個 tick 重試。
     """
 
@@ -117,25 +118,21 @@ class DailyDigestAlerter:
         self.notifier = notifier
         self.fire_time = fire_time
         self.log = log
-        self._acc: dict[str, object] = {}      # symbol -> TickRow (保留最新)
         self._day: Optional[date] = None
         self._sent = False
 
     def process(self, now: datetime, rows: Sequence) -> list[str]:
-        """rows: list[TickRow]。回傳本次彙整推播的代號清單 (未到時間或已送則空)。"""
+        """rows: 當下這個 tick 通過篩選的個股。回傳本次推播的代號清單 (未到時間或已送則空)。"""
         if now.date() != self._day:                      # 跨交易日 -> 重置
             self._day = now.date()
-            self._acc = {}
             self._sent = False
-        for r in rows:                                   # 持續累積已確認個股 (保留最新一筆)
-            if getattr(r, "stable", False):
-                self._acc[r.symbol] = r
         if self._sent or now.time() < self.fire_time:    # 還沒到推播時間 / 今天已推過
             return []
-        syms = list(self._acc.keys())
+        snapshot = [r for r in rows if getattr(r, "stable", False)]   # 只取「當下」符合的個股
+        syms = [r.symbol for r in snapshot]
         head = f"📈 選股日結 {now:%Y-%m-%d} {now:%H:%M}｜符合 {len(syms)} 檔"
         try:
-            self.notifier.push(_fmt_rows(head, list(self._acc.values()), "(今日尚無符合條件的個股)"))
+            self.notifier.push(_fmt_rows(head, snapshot, "(今日尚無符合條件的個股)"))
         except Exception as exc:                         # noqa: BLE001 — 推播失敗不可中斷選股
             self.log(f"⚠️ LINE 日結推播失敗: {exc} (下個 tick 重試)")
             return []                                     # 不標記 -> 重試
