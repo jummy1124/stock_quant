@@ -64,7 +64,8 @@ USER appuser
 # 持久化：歷史日K 快取 + Excel 輸出
 VOLUME ["/app/.cache", "/app/data"]
 
-# 預設常駐每分鐘篩選 + 內嵌 API；Excel 寫到掛載的 /app/data。
+# 預設常駐每分鐘篩選 + 內嵌 API + 每日 13:00 LINE 推播；Excel 寫到掛載的 /app/data。
+# LINE 需 .env 內的 LINE_CHANNEL_TOKEN / LINE_USER_ID 才會實際推送 (缺值則略過並提示)。
 # 一次性執行：docker run ... --once；其餘參數見 README / API.md。
 ENTRYPOINT ["python", "run_intraday.py"]
-CMD ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000"]
+CMD ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line"]

@@ -22,9 +22,10 @@ services:
       - stock-cache:/app/.cache
       # Excel 輸出落到主機 ./data，方便在主機端開啟 ranking.xlsx
       - ./data:/app/data
-    # 預設常駐每分鐘篩選 + 內嵌 API；Excel 寫到 /app/data。
-    # 要每日 13:00 LINE 推播加上: "--notify","line"
-    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000"]
+    # 預設常駐每分鐘篩選 + 內嵌 API + 每日 13:00 LINE 推播；Excel 寫到 /app/data。
+    # LINE 需在 .env 填 LINE_CHANNEL_TOKEN / LINE_USER_ID 才會實際推送 (缺值則略過並提示)。
+    # 不要 LINE 推播就把 "--notify","line" 拿掉。
+    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line"]
     restart: unless-stopped
 
 volumes:
