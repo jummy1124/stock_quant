@@ -84,17 +84,19 @@ def _ma(closes: list, n: int) -> Optional[float]:
     return sum(closes[-n:]) / n
 
 
-def _closes_including_today(ranker, row) -> list:
-    """組出『含今日』的收盤序列以計算均線。
+def _ma_closes(ranker, row) -> list:
+    """供『站上均線』(5MA/月線) 比較用的收盤序列 —— 只取『已收盤的完成日K』。
 
-    live (盤中即時): 歷史到昨日 + 今日現價 (row.close)
-    eod  (最後交易日): 歷史最後一根就是今日，直接用
+    live (盤中即時): 歷史到昨日為止。**不把盤中尚未收盤的今日現價算進均線**，
+        月線/5MA 以完成日K為準 (等同券商顯示的「月均價」)。先前版本會把今日現價
+        append 進去再取最後 20 根，等於把最舊一根擠掉、又用今日價墊高/拉低自己的均線，
+        對「已從高點回落」的個股會算出偏低的月線，導致現價其實在月線下卻誤判「站上月線」。
+    eod  (最後交易日): 歷史最後一根本來就是今日的完成收盤，已包含在內。
+
+    比較時再用今日現價 (row.close) 去和這條均線比，才是真正的『站上均線』。
     """
     hist = ranker.history(row.symbol) or []
-    h_closes = [float(q.close) for q in hist if q.close is not None]
-    if getattr(ranker, "last_source", "live") == "live" and row.close is not None:
-        return h_closes + [float(row.close)]
-    return h_closes
+    return [float(q.close) for q in hist if q.close is not None]
 
 
 def _prev_high_and_vol(ranker, row):
@@ -133,7 +135,7 @@ def _evaluate(ranker, row, now, cfg: BreakoutConfig) -> Optional[ScoredRow]:
     if price is None:
         return None
 
-    closes = _closes_including_today(ranker, row)
+    closes = _ma_closes(ranker, row)            # 均線用完成日K (盤中不含今日現價)
     prev_high, prev_vol = _prev_high_and_vol(ranker, row)
     reasons = []
 
@@ -285,13 +287,4 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
                        sr.prev_high, sr.vol_ratio, sr.ma5, sr.ma20,
                        "↑" if sr.ma20_up else "", sr.score, " / ".join(sr.reasons)])
 
-        first = 3
-        last = first + len(scored) - 1
-        if scored:
-            for rowcells in ws.iter_rows(min_row=first, max_row=last):
-                for idx in (4, 5, 6, 7, 8, 9, 11):   # 現價/漲幅/昨高/量比/5MA/月線/強度分
-                    rowcells[idx].number_format = "0.00"
-        wb.save(path)
-        return None
-    except Exception as exc:                       # noqa: BLE001
-        return f"寫起漲 Excel 失敗: {type(exc).__name__}: {exc}"
+        first = 

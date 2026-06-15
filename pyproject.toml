@@ -18,6 +18,15 @@ openpyxl = "^3.1.5"
 # 測試僅用標準函式庫 (tests/run_tests.py)，不需額外套件。
 # 之後若導入 pytest / ruff，可加在這一組。
 
+[tool.poetry.group.api]
+optional = true
+
+[tool.poetry.group.api.dependencies]
+# 內嵌 HTTP API (run_intraday.py --serve) 用。CLI/排程不需這些，故獨立成可選群組:
+#   poetry install --with api
+fastapi = "^0.111.0"
+uvicorn = { version = "^0.30.0", extras = ["standard"] }
+
 [tool.poetry.scripts]
 # 安裝後可直接用 `stock-quant ...` 取代 `python run_intraday.py ...`
 stock-quant = "run_intraday:main"

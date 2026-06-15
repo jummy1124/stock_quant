@@ -23,6 +23,7 @@ LINE 推播設定 (擇一；token 等同密碼，勿寫進程式/commit):
 用法:
     python run_intraday.py                                # 盤中每分鐘篩起漲個股 + 寫 ranking.xlsx
     python run_intraday.py --once                         # 立刻跑一次 (盤中=即時 / 非盤中=最後交易日)
+    python run_intraday.py --serve                        # 篩選 + 同進程內嵌 HTTP API (前端輪詢)
     python run_intraday.py --no-breakout                  # 關起漲篩選，改印全部漲幅排行 (3%~漲停前)
     python run_intraday.py --show-pool                    # 同時印第一層漲幅池完整排行
     python run_intraday.py --breakout-vol-projection      # 條件3 改用全日預估量比昨量 (早盤較公允)
@@ -146,6 +147,33 @@ def _load_names(market_arg: str) -> dict:
         return {}
 
 
+def _start_api_server(ranker, host: str, port: int, origins):
+    """合併單一進程: 在背景 thread 起 uvicorn，API 只讀本進程每分鐘 publish 的快照
+    (不自行抓即時價 -> 零重複爬取)。回傳 (service, error)；缺 fastapi/uvicorn 回 (None, msg)。"""
+    try:
+        import threading
+
+        import uvicorn
+
+        from stock_quant.api import create_app
+        from stock_quant.screen_service import ApiConfig, ScreenService
+    except ImportError as exc:
+        return None, (f"缺 API 相依 ({exc}) -> 略過內嵌 API。 "
+                      "請 poetry install --with api")
+
+    cfg = ApiConfig.from_env()
+    if origins:
+        cfg.allowed_origins = tuple(o.strip() for o in origins.split(",") if o.strip()) or ("*",)
+    service = ScreenService(cfg)
+    service.attach_ranker(ranker)               # 沿用本進程已建好的 ranker
+    app = create_app(service=service)
+
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    server.install_signal_handlers = lambda: None   # 非主執行緒不能裝 signal handler
+    threading.Thread(target=server.run, name="api-server", daemon=True).start()
+    return service, None
+
+
 def main(argv=None) -> int:
     load_dotenv()        # 啟動先載入專案根目錄的 .env (不覆蓋已存在的環境變數)
     parser = argparse.ArgumentParser(description="台股盤中起漲篩選 (3%~漲停前一檔漲幅池 + 起漲點 6 條件，每分鐘 print + 寫 Excel)")
@@ -198,6 +226,13 @@ def main(argv=None) -> int:
                         help="條件3: 當日量 / 昨量 下限 (預設 1.2 倍)")
     parser.add_argument("--breakout-vol-projection", action="store_true",
                         help="條件3 改用『全日預估量』比昨量 (盤中早盤較公允；預設用當日累積量直接比)")
+    # --- 內嵌 HTTP API (合併單一進程: tick 一次同時供 Excel/LINE 與 API，零重複爬取) ---
+    parser.add_argument("--serve", action="store_true",
+                        help="在同一進程背景起 HTTP API；前端輪詢 GET /api/screen 讀本進程的篩選快照")
+    parser.add_argument("--api-host", default="0.0.0.0", help="API 監聽位址 (預設 0.0.0.0)")
+    parser.add_argument("--api-port", type=int, default=8000, help="API 監聽埠 (預設 8000)")
+    parser.add_argument("--api-origins", default=None,
+                        help="API CORS 允許來源，逗號分隔 (前端在別網域時設；預設 * 或 ALLOWED_ORIGINS)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (盤中=即時 / 非盤中=最後交易日)")
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
@@ -256,6 +291,18 @@ def main(argv=None) -> int:
         print("沒有歷史資料，請檢查網路或改用 --limit / 指定個股測試。")
         return 1
 
+    api_service = None
+    if args.serve:
+        api_service, api_err = _start_api_server(ranker, args.api_host, args.api_port,
+                                                 args.api_origins)
+        if api_err:
+            print(f"⚠️ {api_err}")
+        else:
+            print(f"🌐 內嵌 API 已啟動: http://{args.api_host}:{args.api_port}  "
+                  f"(Swagger: /docs；前端輪詢 GET /api/screen)")
+            if args.once:
+                print("ℹ️ --once 會跑完一次即結束，API 不會常駐；要持續服務請拿掉 --once。")
+
     def _cycle(now: datetime) -> None:
         rows = ranker.tick(now)
         scored = None
@@ -285,6 +332,9 @@ def main(argv=None) -> int:
             pushed = alerter.process(now, top_rows)
             if pushed:
                 print(f"📨 已推 LINE: {', '.join(pushed)}")
+        # 把本次 tick 的同一份結果 publish 給內嵌 API (前端讀這份快照，不重複爬)
+        if api_service is not None:
+            api_service.publish(now, rows, scored)
 
     if args.once:
         _cycle(datetime.now())

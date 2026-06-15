@@ -22,8 +22,10 @@ RUN pip install --no-cache-dir "poetry==${POETRY_VERSION}"
 COPY pyproject.toml poetry.lock* ./
 
 # 沒有 lock 就先產生一份，再只裝 runtime 相依 (不裝 dev、不裝專案本身)
+# 裝 main + api 群組 (api 為 optional 群組，含 fastapi/uvicorn)，讓 image 能跑
+# CLI 與內嵌 HTTP API (run_intraday.py --serve)。
 RUN if [ ! -f poetry.lock ]; then poetry lock; fi \
-    && poetry install --only main --no-root
+    && poetry install --only main,api --no-root
 
 # 複製原始碼。容器以 `python run_intraday.py` 直接執行 (PYTHONPATH=/app 即可 import
 # stock_quant)，不需把專案本身裝進 venv；故不再 poetry install root，
@@ -62,7 +64,7 @@ USER appuser
 # 持久化：歷史日K 快取 + Excel 輸出
 VOLUME ["/app/.cache", "/app/data"]
 
-# 預設常駐每分鐘篩選，Excel 寫到掛載的 /app/data。
-# 一次性執行：docker run ... --once；其餘參數見 README「用法」。
+# 預設常駐每分鐘篩選 + 內嵌 API；Excel 寫到掛載的 /app/data。
+# 一次性執行：docker run ... --once；其餘參數見 README / API.md。
 ENTRYPOINT ["python", "run_intraday.py"]
-CMD ["--excel", "/app/data/ranking.xlsx"]
+CMD ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000"]
