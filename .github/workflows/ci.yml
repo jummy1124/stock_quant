@@ -1,0 +1,114 @@
+name: CI
+
+# 每次 push / PR 都驗證：先跑測試，main 分支再 build 並推 image 到 Artifact Registry。
+# 這樣每個進 main 的版本都已有「可部署、且驗證過」的 image，供每日 deploy.yml 取用。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# 同一分支新的 push 取消還在跑的舊任務，省資源
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write        # Workload Identity Federation 換 GCP 短期憑證需要
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 測試：Python 3.10 + Poetry，跑 tests/run_tests.py (含 api 群組)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (py3.10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Poetry
+        run: pipx install poetry==1.8.3
+
+      - name: Cache Poetry venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock', 'pyproject.toml') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-
+
+      - name: Install dependencies (main + api)
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry install --with api --no-root
+
+      - name: Run tests
+        run: poetry run python tests/run_tests.py
+
+  # ---------------------------------------------------------------------------
+  # 2) Build & Push：僅 push 到 main 且測試通過時，build image 推到 Artifact Registry
+  #    tag: <commit-sha> (不可變，供精準部署/回滾) 與 latest (方便人工取用)
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build & push image
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image refs
+        id: img
+        run: |
+          REG="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+          echo "registry=${REG}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${REG}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${REG}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (WIF, keyless)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.img.outputs.sha_tag }}
+            ${{ steps.img.outputs.latest_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Summary
+        run: |
+          echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ steps.img.outputs.sha_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ steps.img.outputs.latest_tag }}\`" >> "$GITHUB_STEP_SUMMARY"

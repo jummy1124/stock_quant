@@ -261,6 +261,7 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
     except ImportError:
         return "未安裝 openpyxl -> 略過寫起漲 Excel"
 
@@ -287,4 +288,27 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
                        sr.prev_high, sr.vol_ratio, sr.ma5, sr.ma20,
                        "↑" if sr.ma20_up else "", sr.score, " / ".join(sr.reasons)])
 
-        first = 
+        # 數字格式 (資料從第 3 列開始: 1=標題, 2=表頭)
+        first = 3
+        last = first + len(scored) - 1
+        if scored:
+            for row in ws.iter_rows(min_row=first, max_row=last):
+                for c in (row[4], row[6], row[8], row[9]):   # 現價 / 昨高 / 5MA / 月線
+                    c.number_format = "0.00"
+                row[5].number_format = "0.00"                # 漲幅%
+                row[7].number_format = "0.00"                # 量比
+                row[11].number_format = "0.0"                # 強度分
+                row[10].alignment = Alignment(horizontal="center")  # 月線上彎
+
+        # 欄寬 + 凍結標題與表頭
+        widths = [6, 8, 12, 6, 9, 8, 9, 7, 9, 11, 9, 8, 40]
+        for idx, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = w
+        ws.freeze_panes = "A3"
+
+        wb.save(path)
+        return None
+    except PermissionError:
+        return f"無法寫入 {path} (檔案可能正被 Excel 開著) -> 本次略過"
+    except Exception as exc:  # noqa: BLE001 — 寫檔失敗不可中斷主迴圈
+        return f"寫起漲 Excel 失敗: {type(exc).__name__}: {exc}"

@@ -1,0 +1,127 @@
+name: Daily Deploy to GCP VM
+
+# 每日固定時段檢查 main 是否有「尚未部署」的新版本，有才部署到 GCP VM。
+#   排程: 00:40 UTC = 08:40 Asia/Taipei (台股 09:00 開盤前)
+#   GitHub 排程為 best-effort，尖峰時可能延後數分鐘，可接受。
+#   也可手動觸發 (workflow_dispatch)，force=true 可略過「無更新」檢查強制重部署。
+on:
+  schedule:
+    - cron: "40 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "強制部署 (略過無更新檢查)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false   # 部署不可被中途取消
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+  GCE_VM_NAME: ${{ vars.GCE_VM_NAME }}
+  GCE_VM_ZONE: ${{ vars.GCE_VM_ZONE }}
+  VM_APP_DIR: ${{ vars.VM_APP_DIR }}
+
+jobs:
+  deploy:
+    name: Check update & deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF, keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ---------------------------------------------------------------------
+      # 更新檢查：以 Artifact Registry 的 `deployed` tag 作為「目前線上版本」的真相。
+      #   - target  = 本次要部署的版本 = main 最新 commit 的 image (CI 已 build 推上)
+      #   - current = `deployed` tag 指向的 image
+      #   兩者 digest 相同 => 線上已是最新，無更新 => 跳過 (除非 force)。
+      # ---------------------------------------------------------------------
+      - name: Resolve image references
+        id: refs
+        run: |
+          set -euo pipefail
+          REG="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+          echo "registry=${REG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "target_image=${REG}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for update
+        id: check
+        run: |
+          set -euo pipefail
+          REG="${{ steps.refs.outputs.registry }}"
+          TARGET="${{ steps.refs.outputs.target_image }}"
+
+          # 目標版本的 image 必須存在 (由 CI build-and-push 產生)
+          TARGET_DIGEST="$(gcloud artifacts docker images describe "${TARGET}" \
+            --format='value(image_summary.digest)' 2>/dev/null || true)"
+          if [ -z "${TARGET_DIGEST}" ]; then
+            echo "::error::找不到 image ${TARGET}。請確認 CI (build-and-push) 已對 main 的 ${GITHUB_SHA} 成功推送 image。"
+            exit 1
+          fi
+
+          # 目前線上版本 (deployed tag)，首次部署可能不存在
+          CURRENT_DIGEST="$(gcloud artifacts docker images describe "${REG}:deployed" \
+            --format='value(image_summary.digest)' 2>/dev/null || true)"
+
+          echo "target_digest=${TARGET_DIGEST}"  >> "$GITHUB_OUTPUT"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          if [ "${TARGET_DIGEST}" = "${CURRENT_DIGEST}" ] && [ "${FORCE}" != "true" ]; then
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "🟢 線上已是最新版本 (${CURRENT_DIGEST})，無需部署。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "🚀 偵測到新版本，準備部署 ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 目標 digest: \`${TARGET_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 線上 digest: \`${CURRENT_DIGEST:-無 (首次部署)}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ---------------------------------------------------------------------
+      # 部署：把部署資產 scp 到 VM，透過 IAP 隧道 SSH 執行 deploy_on_vm.sh
+      # ---------------------------------------------------------------------
+      - name: Copy deploy assets to VM
+        if: steps.check.outputs.should_deploy == 'true'
+        run: |
+          set -euo pipefail
+          gcloud compute scp --zone "${GCE_VM_ZONE}" --tunnel-through-iap \
+            deploy/docker-compose.deploy.yml deploy/deploy_on_vm.sh \
+            "${GCE_VM_NAME}:${VM_APP_DIR}/" --quiet
+
+      - name: Deploy on VM (pull + restart + health check)
+        if: steps.check.outputs.should_deploy == 'true'
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.refs.outputs.target_image }}"
+          REGION_HOST="${GCP_REGION}-docker.pkg.dev"
+          gcloud compute ssh "${GCE_VM_NAME}" --zone "${GCE_VM_ZONE}" --tunnel-through-iap --quiet \
+            --command="cd '${VM_APP_DIR}' && chmod +x deploy_on_vm.sh && \
+              APP_DIR='${VM_APP_DIR}' IMAGE='${TARGET}' REGION_HOST='${REGION_HOST}' \
+              bash deploy_on_vm.sh"
+
+      # 部署成功後，把 `deployed` tag 指向這次的版本 (線上真相 / 回滾基準)
+      - name: Mark image as deployed
+        if: steps.check.outputs.should_deploy == 'true'
+        run: |
+          set -euo pipefail
+          gcloud artifacts docker tags add \
+            "${{ steps.refs.outputs.target_image }}" \
+            "${{ steps.refs.outputs.registry }}:deployed" --quiet
+          echo "✅ 已部署並標記 deployed -> ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
