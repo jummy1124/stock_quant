@@ -1,0 +1,24 @@
+# VM 端正式部署用 compose：不在 VM build，直接用 CI 推到 Artifact Registry 的預建 image。
+# 由 deploy_on_vm.sh 以環境變數 IMAGE 指定要跑的版本，例如:
+#   IMAGE=asia-east1-docker.pkg.dev/PROJECT/stock-quant/stock-quant:<sha>
+# .env (LINE 密鑰) 與 ./data 由 VM 上的 ${VM_APP_DIR} 提供，不進 git。
+services:
+  stock-quant:
+    image: ${IMAGE}
+    container_name: stock-quant
+    environment:
+      TZ: Asia/Taipei
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - stock-cache:/app/.cache
+      - ./data:/app/data
+    # 與開發 compose 一致：常駐每分鐘篩選 + 內嵌 API(/health 用) + 每日 LINE 推播
+    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line"]
+    restart: unless-stopped
+
+volumes:
+  stock-cache:
