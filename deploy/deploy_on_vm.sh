@@ -35,11 +35,11 @@ log() { echo "[$(date '+%F %T')] $*"; }
 # 是否需要 sudo 才能跑 docker (OS Login 服務帳戶通常需要；在 docker 群組則不需)
 if docker info >/dev/null 2>&1; then SUDO=""; else SUDO="sudo"; fi
 
-# docker compose v2 (plugin) 或舊版 docker-compose
+# docker compose v2 (plugin) 或舊版 docker-compose (不含 sudo;啟動時用 sudo env 帶入變數)
 if ${SUDO} docker compose version >/dev/null 2>&1; then
-  DC="${SUDO} docker compose"
+  DC_BIN="docker compose"
 else
-  DC="${SUDO} docker-compose"
+  DC_BIN="docker-compose"
 fi
 
 # 紀錄目前線上 image，供回滾使用 (容器不存在則為空 = 首次部署)
@@ -69,7 +69,8 @@ health_check() {
 }
 
 bring_up() {
-  IMAGE="$1" ${DC} -f "${COMPOSE_FILE}" up -d --remove-orphans
+  # 用 sudo env 帶入 IMAGE，避免 sudo 清掉前置環境變數導致 compose 取不到 ${IMAGE}
+  ${SUDO} env IMAGE="$1" ${DC_BIN} -f "${COMPOSE_FILE}" up -d --remove-orphans
 }
 
 log "啟動新版本..."
