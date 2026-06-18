@@ -111,6 +111,27 @@ sudo cp /path/to/your/.env /opt/stock-quant/.env      # 內含 LINE_CHANNEL_TOKE
 
 > GitHub 排程為 best-effort，尖峰時可能延後幾分鐘，屬正常。
 
+## VM 每日開機自動推播對外 IP
+
+VM 每天 08:30 開機、14:00 關機，且**每次開機的對外 IP 都會變**。app 啟動時會自動
+抓 GCE 對外 IP 並推一則 LINE 通知（沿用既有的 LINE Messaging API），讓你知道當日 IP。
+
+運作方式：
+
+- `deploy/docker-compose.deploy.yml` 的容器設 `restart: unless-stopped`，VM 開機 →
+  Docker daemon 啟動 → 容器自動重啟 → app 啟動，等於每天開機觸發一次。
+- 啟動指令帶 `--notify-ip-on-start`：`stock_quant/netinfo.py` 向 GCE metadata server
+  (`169.254.169.254`) 查第一張網卡的對外 IP，再用 `LineNotifier` 推一則
+  「🟢 VM 已開機 + 今日對外 IP」。
+- 取不到 IP（非 GCE）或 LINE 未設定時安靜略過，不影響選股主程式。
+
+前置需求（多數已具備）：
+
+- VM 的 `${VM_APP_DIR}/.env` 內有 `LINE_CHANNEL_TOKEN` / `LINE_USER_ID`（與每日選股推播共用）。
+- VM 有對外 IP（預設 ephemeral IP 即可）；容器能連 metadata server（GCE 上預設可達）。
+
+> 若想改用固定 IP 免推播，可在 GCP 保留靜態外部 IP 綁定 VM；關機時段會有少量閒置費。
+
 ## 回滾
 
 1. 找上一版的 commit SHA（或 `:deployed` 之前指向的 image）。
