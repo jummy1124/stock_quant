@@ -17,7 +17,8 @@ services:
       - stock-cache:/app/.cache
       - ./data:/app/data
     # 與開發 compose 一致：常駐每分鐘篩選 + 內嵌 API(/health 用) + 每日 LINE 推播
-    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line"]
+    # --notify-ip-on-start：VM 每日開機 -> 容器自動重啟 -> 啟動時推一則當日對外 IP
+    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line", "--notify-ip-on-start"]
     restart: unless-stopped
 
 volumes:

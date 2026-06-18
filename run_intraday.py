@@ -44,6 +44,7 @@ from stock_quant.datasource import load_market_history
 from stock_quant.domain import Market
 from stock_quant.excel_export import save_ranking
 from stock_quant.intraday import IntradayRanker
+from stock_quant.netinfo import push_startup_ip
 from stock_quant.notify import DailyDigestAlerter, LineNotifier, StableAlerter, load_dotenv
 from stock_quant.scheduler import MarketClock, run_market_loop
 from stock_quant.universe import load_name_map
@@ -211,6 +212,8 @@ def main(argv=None) -> int:
                         help="daily 模式的推播時間 HH:MM (預設 13:00)")
     parser.add_argument("--notify-top", type=int, default=0,
                         help="LINE 推播的前 N 名 (0=全部符合的)")
+    parser.add_argument("--notify-ip-on-start", action="store_true",
+                        help="啟動時推一則本機 (GCE VM) 對外 IP 到 LINE；每天開機自動推當日 IP")
     # --- 第二層 起漲點篩選 (6 條件)；預設開啟，畫面直接印「已篩出起漲的個股」 ---
     parser.add_argument("--no-breakout", action="store_true",
                         help="關閉起漲點篩選，改回印全部漲幅排行 (3%%~漲停前)")
@@ -241,6 +244,8 @@ def main(argv=None) -> int:
     market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
+    if args.notify_ip_on_start:                      # 開機(=app 啟動)推一次當日對外 IP
+        push_startup_ip(LineNotifier())
     use_eod = not args.no_screen_when_closed       # 非交易時間是否用最後交易日資料
     excel_path = None if args.no_excel else args.excel
     name_map = {} if args.no_names else _load_names(args.market)
