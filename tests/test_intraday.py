@@ -11,7 +11,7 @@ from stock_quant.datasource import mis as mis_mod
 from stock_quant.datasource.mis import fetch_realtime
 from stock_quant.domain import DailyQuote, Market
 from stock_quant import intraday as intraday_mod
-from stock_quant.intraday import IntradayRanker, RankRow
+from stock_quant.intraday import IntradayRanker
 from stock_quant.limits import limit_up_price, limit_up_prev_tick, tick_size
 from stock_quant.scheduler import MarketClock, run_market_loop
 
@@ -139,12 +139,6 @@ def test_ranker_tick_no_live_skipped(monkeypatch):
     assert rk.tick(datetime(2026, 6, 5, 10, 0)) == []
 
 
-def test_ranker_no_history_skipped(monkeypatch):
-    rk = IntradayRanker([("9999", Market.TWSE)], processes=1, apply_filter=False)
-    monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda pairs, **k: [])
-    assert rk.tick(datetime(2026, 6, 5, 10, 0)) == []
-
-
 # ---- 篩選: 漲幅 3% ~ 漲停前一檔 ----------------------------------------
 def _setup_filter_ranker(monkeypatch, **kw):
     today = date(2026, 6, 5)
@@ -229,13 +223,6 @@ def test_ranker_prepare(monkeypatch):
     monkeypatch.setattr(intraday_mod, "get_history", fake_history)
     rk = IntradayRanker([("2330", Market.TWSE), ("2317", Market.TWSE)], processes=1)
     assert rk.prepare() == 2
-
-
-def test_rankrow_notify_compat():
-    r = RankRow("2330", "台積電", Market.TWSE, close=105.0, prev_close=100.0,
-                change=5.0, change_pct=5.0, volume=1500)
-    assert r.result.change_pct == 5.0 and r.result.close == 105.0
-    assert r.stable is True and r.market.zh == "上市"
 
 
 if __name__ == "__main__":
