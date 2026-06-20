@@ -43,7 +43,8 @@ def push_startup_ip(notifier, log: Callable[[str], None] = print,
         log(f"⚠️ 取得對外 IP 失敗 (可能非 GCE 環境): {exc}")
         return None
     when = now or datetime.now()
-    text = f"🟢 VM 已開機 {when:%Y-%m-%d %H:%M}\n今日對外 IP：{ip}"
+    # 帶 http:// 前綴，LINE 會自動轉成可點擊連結；前端 Vite 預設埠 5173。
+    text = f"🟢 VM 已開機 {when:%Y-%m-%d %H:%M}\n今日前端網址：http://{ip}:5173"
     try:
         notifier.push(text)
     except Exception as exc:  # noqa: BLE001
