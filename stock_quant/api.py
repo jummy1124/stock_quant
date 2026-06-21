@@ -4,6 +4,9 @@
 tick 一次後 publish 給這裡的 ScreenService，前端輪詢 GET /api/screen 直接讀快照
 (毫秒回應，且不會重複爬即時價)。本檔只負責 web 層 (FastAPI / pydantic / CORS / 端點)。
 
+歷史端點 GET /api/history/{symbol} 例外: 它即時向交易所逐月抓歷史日K (含 TTL 快取)，
+不讀快照 — 詳見 history_api.py 與 API.md。
+
 設定見 screen_service.ApiConfig / API.md。
 ⚠️ 篩選為資訊參考，非投資建議。
 """
@@ -11,11 +14,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .history_api import get_history_candles
 from .screen_service import (ApiConfig, ScreenService, breakout_to_dict,
                              meta_to_dict, stock_to_dict)
 
@@ -72,6 +76,30 @@ class PoolResponse(BaseModel):
     results: list[StockRow]
 
 
+class Candle(BaseModel):
+    date: str = Field(..., description="交易日 YYYY-MM-DD")
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    volume: Optional[int] = Field(None, description="成交股數")
+    lots: Optional[float] = Field(None, description="成交量(張)")
+    change: Optional[float] = Field(None, description="漲跌價")
+    ma5: Optional[float] = Field(None, description="5 日均線")
+    ma20: Optional[float] = Field(None, description="20 日均線 (月線)")
+    ma60: Optional[float] = Field(None, description="60 日均線 (季線)")
+
+
+class HistoryResponse(BaseModel):
+    symbol: str = Field(..., description="股票代號")
+    market: str = Field("", description="市場 (上市/上櫃)")
+    market_code: str = Field("", description="市場代碼 (TWSE/TPEX)")
+    months: int = Field(6, description="抓取月數")
+    count: int = Field(0, description="K 棒數量")
+    cached: bool = Field(False, description="是否命中後端快取")
+    candles: list[Candle] = Field(default_factory=list, description="時間升冪日K")
+
+
 # ============================================================
 # FastAPI app
 # ============================================================
@@ -83,8 +111,9 @@ def create_app(service: Optional[ScreenService] = None) -> FastAPI:
 
     app = FastAPI(
         title="台股盤中起漲篩選 API",
-        version="1.0.0",
-        description="GET /api/screen 取最新起漲個股 (由 run_intraday --serve 每分鐘更新)。"
+        version="1.1.0",
+        description="GET /api/screen 取最新起漲個股 (由 run_intraday --serve 每分鐘更新)；"
+                    "GET /api/history/{symbol} 取個股歷史日K (含 MA5/20/60)。"
                     "⚠️ 資訊參考，非投資建議。",
     )
     app.add_middleware(
@@ -144,5 +173,29 @@ def create_app(service: Optional[ScreenService] = None) -> FastAPI:
             meta=Meta(**meta_to_dict(snap, svc, len(rows))),
             results=[StockRow(**stock_to_dict(r)) for r in rows],
         )
+
+    @app.get("/api/history/{symbol}", response_model=HistoryResponse,
+             tags=["history"], summary="個股歷史日K (含 MA5/20/60)")
+    def history(
+        symbol: str = Path(..., description="股票代號，例如 2330"),
+        months: int = Query(6, ge=1, le=24, description="抓取月數 (1~24)"),
+        market: Optional[str] = Query(
+            None, description="市場代碼 TWSE/TPEX，省略則自動判別 (先試上市再試上櫃)"),
+    ):
+        """逐月抓取歷史日K (TWSE STOCK_DAY / TPEx)，在後端算好均線後回傳。
+
+        資料即時向交易所抓取並做 TTL 快取 (盤後一天才變一次)。查無資料時回 200 +
+        candles=[]，前端可顯示「無歷史資料」。
+        """
+        try:
+            data = get_history_candles(symbol, market_code=market, months=months)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                status_code=502,
+                content={"symbol": symbol, "market": "", "market_code": "",
+                         "months": months, "count": 0, "cached": False,
+                         "candles": [], "detail": f"歷史資料抓取失敗: {exc}"},
+            )
+        return HistoryResponse(**data)
 
     return app

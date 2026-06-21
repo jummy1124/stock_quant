@@ -44,9 +44,42 @@ docker compose up -d --build
 | GET | `/api/meta` | 只回中繼資訊（資料時間、資料源、檔數、警告） |
 | GET | `/api/screen` | **主端點**：最新起漲個股（6 條件），依強度分排序 |
 | GET | `/api/pool` | 第一層漲幅池（3%~漲停前一檔），除錯/備用 |
+| GET | `/api/history/{symbol}` | **個股歷史日K**：OHLC + 成交量 + MA5/20/60（給 K 線圖用） |
 
 `/api/screen` 查詢參數：`top`（只取前 N 名，0=全部）、`min_score`（強度分下限）。
 `/api/pool` 查詢參數：`top`。
+`/api/history/{symbol}` 查詢參數：`months`（抓取月數 1~24，預設 6）、`market`（`TWSE`/`TPEX`，省略則自動判別）。
+
+### `GET /api/history/{symbol}` 說明與回應範例
+
+與 `/api/screen` 讀「每分鐘快照」不同，歷史端點是**即時向交易所逐月抓取**
+（上市 TWSE `STOCK_DAY`、上櫃 TPEx），在後端算好 5/20/60 日均線後回傳，並做
+TTL 記憶體快取（盤後資料一天才變一次，預設 30 分鐘）。所以第一次查某檔較慢
+（要逐月請求），之後同檔同區間都走快取、毫秒回應。`candles` 為**時間升冪**。
+查無資料時回 `200` + `candles: []`（不是錯誤）；抓取失敗回 `502`。
+
+```jsonc
+{
+  "symbol": "2330",
+  "market": "上市",
+  "market_code": "TWSE",
+  "months": 6,
+  "count": 122,
+  "cached": false,
+  "candles": [
+    {
+      "date": "2026-01-05",
+      "open": 100.0, "high": 103.5, "low": 99.5, "close": 102.0,
+      "volume": 25000000, "lots": 25000.0, "change": 2.0,
+      "ma5": null, "ma20": null, "ma60": null   // 視窗未滿時為 null
+    }
+    // ...（升冪到最近交易日）
+  ]
+}
+```
+
+> 均線採簡單移動平均（SMA）；視窗未滿 N 根（或視窗內有缺值）該日均線為 `null`，
+> 前端畫線時需略過 `null` 點。
 
 ### `GET /api/screen` 回應範例
 
