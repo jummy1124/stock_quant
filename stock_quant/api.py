@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .history_api import get_history_candles
+from .history_api import get_history_candles, get_intraday_quote
 from .screen_service import (ApiConfig, ScreenService, breakout_to_dict,
                              meta_to_dict, stock_to_dict)
 
@@ -97,7 +97,24 @@ class HistoryResponse(BaseModel):
     months: int = Field(6, description="抓取月數")
     count: int = Field(0, description="K 棒數量")
     cached: bool = Field(False, description="是否命中後端快取")
+    intraday: bool = Field(False, description="末根是否為今日盤中即時K")
+    source: Optional[str] = Field(None, description="盤中即時=live / 非交易時間=eod")
+    as_of: Optional[str] = Field(None, description="盤中K取得時間 ISO8601 (intraday 時才有)")
     candles: list[Candle] = Field(default_factory=list, description="時間升冪日K")
+
+
+class QuoteResponse(BaseModel):
+    symbol: str = Field(..., description="股票代號")
+    market: str = Field("", description="市場 (上市/上櫃)")
+    market_code: str = Field("", description="市場代碼 (TWSE/TPEX)")
+    trading: bool = Field(False, description="目前是否為交易時間 (09:00-13:30 週一至五)")
+    source: Optional[str] = Field(None, description="live=盤中即時 / eod=最後成交價")
+    as_of: Optional[str] = Field(None, description="報價取得時間 ISO8601")
+    prev_close: Optional[float] = Field(None, description="昨收")
+    close: Optional[float] = Field(None, description="現價 / 最新成交價")
+    change: Optional[float] = Field(None, description="漲跌價")
+    change_pct: Optional[float] = Field(None, description="漲幅%")
+    candle: Optional[Candle] = Field(None, description="今日(或最後交易日)一根，可接到日K尾端")
 
 
 # ============================================================
@@ -181,21 +198,51 @@ def create_app(service: Optional[ScreenService] = None) -> FastAPI:
         months: int = Query(6, ge=1, le=24, description="抓取月數 (1~24)"),
         market: Optional[str] = Query(
             None, description="市場代碼 TWSE/TPEX，省略則自動判別 (先試上市再試上櫃)"),
+        intraday: bool = Query(
+            False, description="是否把今日盤中即時價接到日K尾端 (交易時間有效)"),
     ):
         """逐月抓取歷史日K (TWSE STOCK_DAY / TPEx)，在後端算好均線後回傳。
 
         資料即時向交易所抓取並做 TTL 快取 (盤後一天才變一次)。查無資料時回 200 +
-        candles=[]，前端可顯示「無歷史資料」。
+        candles=[]，前端可顯示「無歷史資料」。intraday=true 時，於回應前接上今日盤中
+        即時K (這根不進快取)；前端可再輪詢 /api/quote/{symbol} 持續更新。
         """
         try:
-            data = get_history_candles(symbol, market_code=market, months=months)
+            data = get_history_candles(
+                symbol, market_code=market, months=months, intraday=intraday)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse(
                 status_code=502,
                 content={"symbol": symbol, "market": "", "market_code": "",
                          "months": months, "count": 0, "cached": False,
+                         "intraday": False, "source": None, "as_of": None,
                          "candles": [], "detail": f"歷史資料抓取失敗: {exc}"},
             )
         return HistoryResponse(**data)
+
+    @app.get("/api/quote/{symbol}", response_model=QuoteResponse,
+             tags=["history"], summary="個股盤中最新價 (單檔即時)")
+    def quote(
+        symbol: str = Path(..., description="股票代號，例如 2330"),
+        market: Optional[str] = Query(
+            None, description="市場代碼 TWSE/TPEX，省略則自動判別 (先試上市再試上櫃)"),
+    ):
+        """單檔盤中即時報價，給歷史圖表輪詢更新「今日K + 現價線」用。
+
+        交易時間回 MIS 盤中即時價 (source=live)；非交易時間回最後成交價 (source=eod)。
+        查無資料時回 200 + candle=null。⚠️ 資訊參考，非投資建議。
+        """
+        try:
+            data = get_intraday_quote(symbol, market_code=market)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                status_code=502,
+                content={"symbol": symbol, "market": "", "market_code": "",
+                         "trading": False, "source": None, "as_of": None,
+                         "prev_close": None, "close": None, "change": None,
+                         "change_pct": None, "candle": None,
+                         "detail": f"即時報價抓取失敗: {exc}"},
+            )
+        return QuoteResponse(**data)
 
     return app

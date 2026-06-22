@@ -7,6 +7,8 @@
 - 在這層算好 MA5/20/60 (簡單移動平均)，前端只負責畫。
 - TTL 記憶體快取: 同一檔在 cache_ttl 秒內重複查詢直接回快取，避免逐月請求把
   證交所打到限流 (盤後資料一天才變一次，TTL 給長一點很安全)。
+- 盤中即時: get_intraday_quote() 抓單檔 MIS 即時價；get_history_candles(intraday=True)
+  會把今日盤中K接到日K尾端 (這根不進快取)。
 
 只用標準函式庫 + 既有 stock_quant 模型；沒裝 fastapi 也能 import/測試。
 ⚠️ 資訊參考，非投資建議。
@@ -15,11 +17,14 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
 from .datasource.history import get_history
+from .datasource.mis import fetch_realtime
 from .domain import DailyQuote, Market
+from .scheduler import MarketClock
 
 # ============================================================
 # 均線
@@ -81,6 +86,102 @@ def quotes_to_candles(quotes: list[DailyQuote], ma_windows=(5, 20, 60)) -> list[
     return candles
 
 
+def _apply_ma(candles: list[dict], ma_windows=(5, 20, 60)) -> None:
+    """就地（重新）計算 candle 串的 MA 欄位；合併今日盤中K後重算用。"""
+    closes = [c.get("close") for c in candles]
+    for n in ma_windows:
+        series = _sma(closes, n)
+        for i, c in enumerate(candles):
+            c[f"ma{n}"] = series[i]
+
+
+# ============================================================
+# 盤中即時報價（單檔）— 給「今日K」與 /api/quote 用
+# ============================================================
+
+_CLOCK = MarketClock()
+
+
+def _quote_to_candle(q: DailyQuote) -> dict:
+    vol = q.volume
+    return {
+        "date": q.trade_date.isoformat(),
+        "open": _f(q.open),
+        "high": _f(q.high),
+        "low": _f(q.low),
+        "close": _f(q.close),
+        "volume": vol,
+        "lots": round(vol / 1000, 1) if vol is not None else None,
+        "change": _f(q.change),
+    }
+
+
+def _fetch_live_quote(symbol: str, market: Optional[Market]) -> Optional[DailyQuote]:
+    """抓單一檔的 MIS 即時報價；market 未知時先試上市再試上櫃。查無回 None。"""
+    markets = [market] if market else [Market.TWSE, Market.TPEX]
+    for m in markets:
+        try:
+            res = fetch_realtime([(symbol, m)], batch_size=1, processes=1)
+        except Exception:  # noqa: BLE001 — 即時價失敗不應拖垮歷史端點
+            res = []
+        if res:
+            return res[0]
+    return None
+
+
+def get_intraday_quote(
+    symbol: str,
+    market_code: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """取單一檔的「目前最新價」。
+
+    交易時間回 MIS 盤中即時價 (source=live)，非交易時間回 MIS 最後成交價 (source=eod)。
+    回傳: {symbol, market, market_code, trading, source, as_of,
+           prev_close, close, change, change_pct, candle|None}
+    candle 為「今日(或最後交易日)」的一根，可直接接到歷史日K尾端。
+    """
+    now = now or datetime.now()
+    symbol = (symbol or "").strip()
+    market = _resolve_market(market_code)
+    trading = _CLOCK.is_trading(now)
+
+    q = _fetch_live_quote(symbol, market)
+    if q is None:
+        return {
+            "symbol": symbol,
+            "market": getattr(market, "zh", "") if market else "",
+            "market_code": getattr(market, "value", "") if market else "",
+            "trading": trading,
+            "source": "live" if trading else "eod",
+            "as_of": now.isoformat(timespec="seconds"),
+            "prev_close": None, "close": None, "change": None, "change_pct": None,
+            "candle": None,
+        }
+
+    close = _f(q.close)
+    change = _f(q.change)
+    prev_close = round(close - change, 4) if (close is not None and change is not None) else None
+    change_pct = (
+        round(change / prev_close * 100.0, 2)
+        if (change is not None and prev_close)
+        else None
+    )
+    return {
+        "symbol": symbol or q.symbol,
+        "market": q.market.zh,
+        "market_code": q.market.value,
+        "trading": trading,
+        "source": "live" if trading else "eod",
+        "as_of": now.isoformat(timespec="seconds"),
+        "prev_close": prev_close,
+        "close": close,
+        "change": change,
+        "change_pct": change_pct,
+        "candle": _quote_to_candle(q),
+    }
+
+
 # ============================================================
 # TTL 記憶體快取
 # ============================================================
@@ -123,15 +224,42 @@ def _resolve_market(market_code: Optional[str]) -> Optional[Market]:
     return None
 
 
+def _merge_today_candle(
+    candles: list[dict], today: dict, ma_windows=(5, 20, 60)
+) -> list[dict]:
+    """把今日盤中K接到歷史日K尾端 (不污染快取: 回傳新串)。
+
+    - 末根日期 == 今日 → 用即時OHLC覆寫 (保留原本算好的 MA，僅換價/量)。
+    - 否則 → 附加一根今日K，並重算整串 MA 使今日均線點正確。
+    """
+    merged = [dict(c) for c in candles]  # 淺拷貝每根，避免改到快取內容
+    if merged and merged[-1].get("date") == today.get("date"):
+        last = merged[-1]
+        for k in ("open", "high", "low", "close", "volume", "lots", "change"):
+            last[k] = today.get(k)
+        _apply_ma(merged, ma_windows)
+    else:
+        new_row = dict(today)
+        for n in ma_windows:
+            new_row.setdefault(f"ma{n}", None)
+        merged.append(new_row)
+        _apply_ma(merged, ma_windows)
+    return merged
+
+
 def get_history_candles(
     symbol: str,
     market_code: Optional[str] = None,
     months: int = 6,
     ma_windows=(5, 20, 60),
+    intraday: bool = False,
+    now: Optional[datetime] = None,
 ) -> dict:
     """抓歷史日K並序列化成 API 回應 dict (含 TTL 快取)。
 
-    回傳: {"symbol", "market", "market_code", "months", "count", "cached", "candles"[]}
+    intraday=True 時，於回傳前接上「今日盤中即時K」(不寫入快取，因為盤中會變動)。
+    回傳: {"symbol","market","market_code","months","count","cached","candles"[],
+           "intraday","source","as_of"}
     """
     symbol = (symbol or "").strip()
     market = _resolve_market(market_code)
@@ -139,15 +267,34 @@ def get_history_candles(
 
     cached = _CACHE.get(key)
     if cached is not None:
-        return _wrap(symbol, market, months, cached, cached=True)
+        candles = cached
+        is_cached = True
+    else:
+        quotes = get_history(symbol, market, months=months)
+        candles = quotes_to_candles(quotes, ma_windows=ma_windows)
+        _CACHE.put(key, candles)
+        is_cached = False
 
-    quotes = get_history(symbol, market, months=months)
-    candles = quotes_to_candles(quotes, ma_windows=ma_windows)
-    _CACHE.put(key, candles)
-    return _wrap(symbol, market, months, candles, cached=False)
+    intraday_applied = False
+    source = None
+    as_of = None
+    if intraday:
+        quote = get_intraday_quote(symbol, market_code, now=now)
+        source = quote.get("source")
+        as_of = quote.get("as_of")
+        today = quote.get("candle")
+        if today is not None:
+            candles = _merge_today_candle(candles, today, ma_windows)
+            intraday_applied = True
+
+    return _wrap(
+        symbol, market, months, candles, cached=is_cached,
+        intraday=intraday_applied, source=source, as_of=as_of,
+    )
 
 
-def _wrap(symbol, market, months, candles, *, cached) -> dict:
+def _wrap(symbol, market, months, candles, *, cached,
+          intraday=False, source=None, as_of=None) -> dict:
     return {
         "symbol": symbol,
         "market": getattr(market, "zh", "") if market else "",
@@ -155,5 +302,8 @@ def _wrap(symbol, market, months, candles, *, cached) -> dict:
         "months": int(months),
         "count": len(candles),
         "cached": cached,
+        "intraday": intraday,
+        "source": source,
+        "as_of": as_of,
         "candles": candles,
     }
