@@ -45,10 +45,28 @@ docker compose up -d --build
 | GET | `/api/screen` | **主端點**：最新起漲個股（6 條件），依強度分排序 |
 | GET | `/api/pool` | 第一層漲幅池（3%~漲停前一檔），除錯/備用 |
 | GET | `/api/history/{symbol}` | **個股歷史日K**：OHLC + 成交量 + MA5/20/60（給 K 線圖用） |
+| GET | `/api/quote/{symbol}` | **個股盤中最新價**（單檔即時）：給圖表輪詢更新「今日K + 現價線」 |
 
 `/api/screen` 查詢參數：`top`（只取前 N 名，0=全部）、`min_score`（強度分下限）。
 `/api/pool` 查詢參數：`top`。
-`/api/history/{symbol}` 查詢參數：`months`（抓取月數 1~24，預設 6）、`market`（`TWSE`/`TPEX`，省略則自動判別）。
+`/api/history/{symbol}` 查詢參數：`months`（抓取月數 1~24，預設 6）、`market`（`TWSE`/`TPEX`，省略則自動判別）、`intraday`（`true` 時把今日盤中即時價接到日K尾端，交易時間有效；這根不進快取）。
+`/api/quote/{symbol}` 查詢參數：`market`（`TWSE`/`TPEX`，省略則自動判別）。
+
+### `GET /api/quote/{symbol}` 說明與回應範例
+
+單檔盤中即時報價，搭配 `/api/history/{symbol}?intraday=true` 使用：開圖時用 history 帶今日K，
+之後前端每 ~30 秒輪詢本端點更新最右邊那根 K 棒與「現價線」。交易時間（週一至五 09:00–13:30）
+回 MIS 盤中即時價（`source=live`）；非交易時間回最後成交價（`source=eod`）。查無資料回 `200` + `candle=null`。
+
+```jsonc
+{
+  "symbol": "2330", "market": "上市", "market_code": "TWSE",
+  "trading": true, "source": "live", "as_of": "2026-06-22T10:32:00",
+  "prev_close": 104.0, "close": 107.0, "change": 3.0, "change_pct": 2.88,
+  "candle": { "date": "2026-06-22", "open": 104.0, "high": 108.0, "low": 103.0,
+              "close": 107.0, "volume": 500000, "lots": 500.0, "change": 3.0 }
+}
+```
 
 ### `GET /api/history/{symbol}` 說明與回應範例
 
