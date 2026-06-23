@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from .breakout_screen import ScoredRow
+from .breakout_screen import BreakoutConfig, ScoredRow, screen_breakout
 from .intraday import IntradayRanker, RankRow
 
 
@@ -48,8 +48,10 @@ class Snapshot:
     quotable: int                     # 實際可算漲幅檔數
     pool_size: int                    # 通過漲幅池的檔數
     warning: Optional[str]            # 即時報價失敗摘要 (若有)
-    pool: list = field(default_factory=list)        # list[RankRow]
-    breakout: list = field(default_factory=list)    # list[ScoredRow]
+    pool: list = field(default_factory=list)        # list[RankRow] (預設參數的漲幅池)
+    breakout: list = field(default_factory=list)    # list[ScoredRow] (預設參數的起漲結果)
+    raw: list = field(default_factory=list)         # list[RankRow] 全部可算漲幅的原始列 (未過濾)
+                                                    # — 供 API 依使用者參數即時重算漲幅池/起漲篩選
 
 
 # ============================================================
@@ -85,11 +87,15 @@ class ScreenService:
         with self._lock:
             self._snapshot = snap
 
-    def publish(self, now: datetime, rows: list, scored: Optional[list]) -> Snapshot:
+    def publish(self, now: datetime, rows: list, scored: Optional[list],
+                raw: Optional[list] = None) -> Snapshot:
         """把『外部已算好』的漲幅池 rows + 起漲 scored 包成快照發佈。
 
         run_intraday 的每分鐘迴圈 tick 一次後，直接把同一份結果 publish 給 API，
         避免 API 自己再抓一次即時價 (零重複爬取)。
+
+        raw: 全部「可算漲幅」的原始列 (未套用漲幅池過濾)；存進快照供 API 端依使用者
+        參數即時重算。省略時退化為 rows (僅能在預設參數附近重算)。
         """
         if self.ranker is None:
             raise RuntimeError("publish 需先設定 service.ranker (attach_ranker)")
@@ -103,9 +109,27 @@ class ScreenService:
             warning=getattr(r, "last_warning", None),
             pool=list(rows),
             breakout=list(scored or []),
+            raw=list(raw if raw is not None else rows),
         )
         self.set_snapshot(snap)
         return snap
+
+    # --------------------------------------------------------
+    # 依使用者參數即時重算 (讀快照 raw + ranker 歷史，不重抓即時價)
+    # --------------------------------------------------------
+
+    def compute_pool(self, snap: Snapshot, min_change_pct: float = 3.0,
+                     exclude_limit_up: bool = True) -> list:
+        """用快照的原始列依參數重算漲幅池 (list[RankRow])。"""
+        return IntradayRanker.filter_pool(
+            snap.raw, min_change_pct=min_change_pct, exclude_limit_up=exclude_limit_up)
+
+    def compute_breakout(self, snap: Snapshot, pool: list,
+                         cfg: Optional[BreakoutConfig] = None) -> list:
+        """用快照漲幅池 + ranker 歷史依參數重算起漲篩選 (list[ScoredRow])。"""
+        if self.ranker is None:
+            return []
+        return screen_breakout(self.ranker, pool, snap.generated_at, cfg or BreakoutConfig())
 
 
 # ============================================================

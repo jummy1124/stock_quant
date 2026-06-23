@@ -129,29 +129,63 @@ class IntradayRanker:
                 self._history[symbol] = quotes
         return len(self._history)
 
-    def tick(self, now: Optional[datetime] = None) -> list[RankRow]:
-        """抓一次資料算漲幅、篩選、排序。交易時間用即時價；非交易時間用最後交易日完成日K。
+    def tick_raw(self, now: Optional[datetime] = None) -> list[RankRow]:
+        """抓一次資料算漲幅並排序，**不套用漲幅池過濾**。
 
-        回傳已依漲幅由大到小排序的 RankRow 清單。apply_filter=True 時只含「漲幅 3%~漲停前一檔」。
+        回傳全部「可算漲幅」的個股 (依漲幅由大到小)。供 --serve 把原始列存進快照、
+        讓 API 端依使用者參數即時重算漲幅池/起漲篩選 (不必重抓即時價)。
+        交易時間用即時價；非交易時間用最後交易日完成日K。
         """
         now = now or datetime.now()
         if self.eod_when_closed and not self.clock.is_trading(now):
             rows = self._tick_eod(now)
         else:
             rows = self._tick_live(now)
+        return self._sort(rows)
+
+    def tick(self, now: Optional[datetime] = None) -> list[RankRow]:
+        """抓一次資料算漲幅、篩選、排序。交易時間用即時價；非交易時間用最後交易日完成日K。
+
+        回傳已依漲幅由大到小排序的 RankRow 清單。apply_filter=True 時只含「漲幅 3%~漲停前一檔」。
+        """
+        rows = self.tick_raw(now)
         if self.apply_filter:
             rows = [r for r in rows if self._passes(r)]
         self.last_matched = len(rows)
         return self._sort(rows)
 
-    def _passes(self, r: RankRow) -> bool:
-        """漲幅 ≥ min_change_pct 且 (可選) 收盤 ≤ 漲停前一檔。"""
-        if r.change_pct is None or r.change_pct < self.min_change_pct:
+    def _passes(self, r: RankRow, min_change_pct: Optional[float] = None,
+                exclude_limit_up: Optional[bool] = None) -> bool:
+        """漲幅 ≥ min_change_pct 且 (可選) 收盤 ≤ 漲停前一檔。
+
+        參數省略時沿用實例設定 (self.min_change_pct / self.exclude_limit_up)；
+        帶入時即用該值，供 API 端依使用者參數重算漲幅池。
+        """
+        mc = self.min_change_pct if min_change_pct is None else min_change_pct
+        excl = self.exclude_limit_up if exclude_limit_up is None else exclude_limit_up
+        if r.change_pct is None or r.change_pct < mc:
             return False
-        if self.exclude_limit_up and r.prev_close and r.close is not None:
+        if excl and r.prev_close and r.close is not None:
             if r.close > limit_up_prev_tick(r.prev_close) + 1e-9:
                 return False
         return True
+
+    @classmethod
+    def filter_pool(cls, rows: Sequence[RankRow], min_change_pct: float = 3.0,
+                    exclude_limit_up: bool = True) -> list[RankRow]:
+        """對 (未過濾的) RankRow 序列套用漲幅池條件，回傳依漲幅排序的清單。
+
+        無狀態工具: 給 API 端用快照裡的原始列、依使用者參數即時重算漲幅池。
+        """
+        def _ok(r: RankRow) -> bool:
+            if r.change_pct is None or r.change_pct < min_change_pct:
+                return False
+            if exclude_limit_up and r.prev_close and r.close is not None:
+                if r.close > limit_up_prev_tick(r.prev_close) + 1e-9:
+                    return False
+            return True
+
+        return cls._sort([r for r in rows if _ok(r)])
 
     @staticmethod
     def _sort(rows: list[RankRow]) -> list[RankRow]:

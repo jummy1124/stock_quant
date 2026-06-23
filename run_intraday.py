@@ -305,7 +305,16 @@ def main(argv=None) -> int:
                 print("ℹ️ --once 會跑完一次即結束，API 不會常駐；要持續服務請拿掉 --once。")
 
     def _cycle(now: datetime) -> None:
-        rows = ranker.tick(now)
+        # --serve 時取「未過濾原始列」存進快照，讓 API 端依使用者參數即時重算
+        # (零重複爬取)；本進程的 print/Excel/LINE 仍用預設參數的漲幅池。
+        if api_service is not None:
+            raw = ranker.tick_raw(now)
+            rows = ([r for r in raw if ranker._passes(r)] if ranker.apply_filter
+                    else list(raw))
+            ranker.last_matched = len(rows)
+        else:
+            raw = None
+            rows = ranker.tick(now)
         scored = None
         # 預設: 畫面直接印「已篩出起漲的個股」(第二層)；漲幅池只留一行摘要 (--show-pool 可印全表)
         if brk_cfg is not None:
@@ -333,9 +342,10 @@ def main(argv=None) -> int:
             pushed = alerter.process(now, top_rows)
             if pushed:
                 print(f"📨 已推 LINE: {', '.join(pushed)}")
-        # 把本次 tick 的同一份結果 publish 給內嵌 API (前端讀這份快照，不重複爬)
+        # 把本次 tick 的同一份結果 publish 給內嵌 API (前端讀這份快照，不重複爬)；
+        # raw=未過濾原始列，供 API 依使用者參數即時重算漲幅池/起漲篩選。
         if api_service is not None:
-            api_service.publish(now, rows, scored)
+            api_service.publish(now, rows, scored, raw=raw)
 
     if args.once:
         _cycle(datetime.now())

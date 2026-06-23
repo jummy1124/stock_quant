@@ -19,9 +19,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .breakout_screen import BreakoutConfig
 from .history_api import get_history_candles, get_intraday_quote
 from .screen_service import (ApiConfig, ScreenService, breakout_to_dict,
                              meta_to_dict, stock_to_dict)
+
+# 篩選參數預設值 (與 run_intraday CLI / BreakoutConfig 原始設定一致)。
+# 前端 GET /api/screen-defaults 讀這份，當作「恢復預設」依據 (單一真實來源)。
+_DEFAULTS = {
+    # 第一層 漲幅池
+    "min_change": 3.0,            # 漲幅下限 %
+    "exclude_limit_up": True,     # 排除已鎖漲停 (收盤 ≤ 漲停前一檔)
+    # 第二層 起漲點 6 條件
+    "vol_ratio": BreakoutConfig.vol_ratio_min,            # 1.2 當日量/昨量下限
+    "ma_short": BreakoutConfig.ma_short,                  # 5  5MA 天數
+    "ma_mid": BreakoutConfig.ma_mid,                      # 20 月均線天數
+    "ma_slope_lookback": BreakoutConfig.ma_mid_slope_lookback,  # 5 月線上彎回看天數
+    "vol_projection": BreakoutConfig.use_volume_projection,     # False 是否用全日預估量
+}
 
 
 # ============================================================
@@ -62,6 +77,17 @@ class Meta(BaseModel):
     count: int = 0
     warning: Optional[str] = None
     last_error: Optional[str] = None
+
+
+class ScreenDefaults(BaseModel):
+    """篩選參數預設值 (前端「恢復預設」用)。"""
+    min_change: float = Field(..., description="漲幅下限 %")
+    exclude_limit_up: bool = Field(..., description="排除已鎖漲停")
+    vol_ratio: float = Field(..., description="條件3 當日量/昨量下限")
+    ma_short: int = Field(..., description="5MA 天數")
+    ma_mid: int = Field(..., description="月均線天數")
+    ma_slope_lookback: int = Field(..., description="月線上彎回看天數")
+    vol_projection: bool = Field(..., description="條件3 是否用全日預估量")
 
 
 class ScreenResponse(BaseModel):
@@ -158,33 +184,75 @@ def create_app(service: Optional[ScreenService] = None) -> FastAPI:
         snap = svc.snapshot()
         return Meta(**meta_to_dict(snap, svc, len(snap.breakout) if snap else 0))
 
+    @app.get("/api/screen-defaults", response_model=ScreenDefaults, tags=["screen"],
+             summary="篩選參數預設值 (前端『恢復預設』用)")
+    def screen_defaults() -> ScreenDefaults:
+        return ScreenDefaults(**_DEFAULTS)
+
     @app.get("/api/screen", response_model=ScreenResponse, tags=["screen"],
-             summary="最新起漲個股 (6 條件)")
+             summary="最新起漲個股 (6 條件，參數可調)")
     def screen(
         top: int = Query(0, ge=0, description="只取前 N 名 (0=全部)"),
+        # --- 第一層 漲幅池 ---
+        min_change: float = Query(_DEFAULTS["min_change"], description="漲幅下限 %"),
+        exclude_limit_up: bool = Query(_DEFAULTS["exclude_limit_up"],
+                                       description="排除已鎖漲停 (收盤 ≤ 漲停前一檔)"),
+        # --- 第二層 起漲點 6 條件 ---
+        vol_ratio: float = Query(_DEFAULTS["vol_ratio"], gt=0,
+                                 description="條件3 當日量/昨量下限 (預設 1.2)"),
+        ma_short: int = Query(_DEFAULTS["ma_short"], ge=1,
+                              description="5MA 天數 (預設 5)"),
+        ma_mid: int = Query(_DEFAULTS["ma_mid"], ge=1,
+                            description="月均線天數 (預設 20)"),
+        ma_slope_lookback: int = Query(_DEFAULTS["ma_slope_lookback"], ge=0,
+                                       description="月線上彎回看天數 (預設 5)"),
+        vol_projection: bool = Query(_DEFAULTS["vol_projection"],
+                                     description="條件3 改用全日預估量比昨量"),
+    ):
+        """依使用者參數即時重算起漲篩選。
+
+        讀本進程每分鐘 publish 的快照原始列 (snapshot.raw)，套用漲幅池條件後再跑起漲
+        6 條件 — 不重抓即時價，故各使用者參數互不影響、也不增加爬取。參數省略時等同
+        原專案預設 (見 /api/screen-defaults)。
+        """
+        nr = _not_ready()
+        if nr:
+            return nr
+        snap = svc.snapshot()
+        pool_rows = svc.compute_pool(snap, min_change_pct=min_change,
+                                     exclude_limit_up=exclude_limit_up)
+        cfg = BreakoutConfig(
+            vol_ratio_min=vol_ratio, ma_short=ma_short, ma_mid=ma_mid,
+            ma_mid_slope_lookback=ma_slope_lookback, use_volume_projection=vol_projection,
+        )
+        scored = svc.compute_breakout(snap, pool_rows, cfg)
+        rows = scored[:top] if top > 0 else scored
+        m = meta_to_dict(snap, svc, len(rows))
+        m["pool_size"] = len(pool_rows)
+        return ScreenResponse(
+            meta=Meta(**m),
+            results=[BreakoutRow(**breakout_to_dict(sr)) for sr in rows],
+        )
+
+    @app.get("/api/pool", response_model=PoolResponse, tags=["screen"],
+             summary="第一層漲幅池 (參數可調，預設 3%~漲停前一檔)")
+    def pool(
+        top: int = Query(0, ge=0, description="只取前 N 名 (0=全部)"),
+        min_change: float = Query(_DEFAULTS["min_change"], description="漲幅下限 %"),
+        exclude_limit_up: bool = Query(_DEFAULTS["exclude_limit_up"],
+                                       description="排除已鎖漲停 (收盤 ≤ 漲停前一檔)"),
     ):
         nr = _not_ready()
         if nr:
             return nr
         snap = svc.snapshot()
-        rows = list(snap.breakout)
-        if top > 0:
-            rows = rows[:top]
-        return ScreenResponse(
-            meta=Meta(**meta_to_dict(snap, svc, len(rows))),
-            results=[BreakoutRow(**breakout_to_dict(sr)) for sr in rows],
-        )
-
-    @app.get("/api/pool", response_model=PoolResponse, tags=["screen"],
-             summary="第一層漲幅池 (3%~漲停前一檔)")
-    def pool(top: int = Query(0, ge=0, description="只取前 N 名 (0=全部)")):
-        nr = _not_ready()
-        if nr:
-            return nr
-        snap = svc.snapshot()
-        rows = snap.pool[:top] if top > 0 else snap.pool
+        pool_rows = svc.compute_pool(snap, min_change_pct=min_change,
+                                     exclude_limit_up=exclude_limit_up)
+        rows = pool_rows[:top] if top > 0 else pool_rows
+        m = meta_to_dict(snap, svc, len(rows))
+        m["pool_size"] = len(pool_rows)
         return PoolResponse(
-            meta=Meta(**meta_to_dict(snap, svc, len(rows))),
+            meta=Meta(**m),
             results=[StockRow(**stock_to_dict(r)) for r in rows],
         )
 
