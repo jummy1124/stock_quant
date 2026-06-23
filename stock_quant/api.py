@@ -45,7 +45,6 @@ class StockRow(BaseModel):
 
 
 class BreakoutRow(StockRow):
-    score: float = Field(..., description="起漲強度分 0~100 (僅排序用)")
     prev_high: Optional[float] = Field(None, description="昨日最高 (突破基準)")
     vol_ratio: Optional[float] = Field(None, description="當日量/昨量")
     ma5: Optional[float] = None
@@ -164,13 +163,12 @@ def create_app(service: Optional[ScreenService] = None) -> FastAPI:
              summary="最新起漲個股 (6 條件)")
     def screen(
         top: int = Query(0, ge=0, description="只取前 N 名 (0=全部)"),
-        min_score: float = Query(0.0, ge=0, description="強度分下限過濾"),
     ):
         nr = _not_ready()
         if nr:
             return nr
         snap = svc.snapshot()
-        rows = [sr for sr in snap.breakout if sr.score >= min_score]
+        rows = list(snap.breakout)
         if top > 0:
             rows = rows[:top]
         return ScreenResponse(

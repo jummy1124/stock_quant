@@ -7,7 +7,7 @@
   2. 每個 cycle: 抓今日K (交易時間=MIS 即時價 / 非交易時間=最後交易日完成日K)。
   3. 第一層: 對所有有報價的個股算漲幅%，篩 3% ~ 漲停前一檔，依漲幅排序。
   4. 第二層 (預設開啟): 起漲點 6 條件 — 紅K、突破昨高、量增 1.2 倍、站上 5MA、
-     站上月線且月線上彎、昨日仍在 5MA 下；通過者依強度分排序並印出。
+     站上月線且月線上彎、昨日仍在 5MA 下；通過者依序印出。
   5. 漲幅池覆蓋寫入 Excel；--notify line 時把起漲個股推到 LINE。
 
 資料來源依時間自動切換: 交易時間抓 MIS 即時價當今日K；非交易時間改用最後一個交易日的
@@ -98,7 +98,7 @@ def _print_ranking(now: datetime, rows, ranker=None, top: int = 0) -> None:
 
 def _print_breakout(now: datetime, scored, source: str = "live", top: int = 0,
                     pool: int = None) -> None:
-    """印出第二層『起漲點』篩選結果 (6 條件，依強度分排序)。"""
+    """印出第二層『起漲點』篩選結果 (6 條件)。"""
     tag = "盤中即時" if source == "live" else "最後交易日"
     pool_note = f"漲幅池 {pool} 檔 → " if pool is not None else ""
     print(f"\n===== 起漲個股 (紅K+突破昨高+量增+站上5MA+月線上彎+昨日在5MA下) {now:%Y-%m-%d %H:%M:%S} [{tag}] — "
@@ -107,14 +107,14 @@ def _print_breakout(now: datetime, scored, source: str = "live", top: int = 0,
         print("(目前沒有符合起漲條件的個股)")
         return
     shown = scored[:top] if top and top > 0 else scored
-    header = f"{'#':>4}  {'代號':<8}{'名稱':<12}{'現價':>10}{'漲幅%':>9}{'昨高':>10}{'量比':>7}{'強度分':>8}  理由"
+    header = f"{'#':>4}  {'代號':<8}{'名稱':<12}{'現價':>10}{'漲幅%':>9}{'昨高':>10}{'量比':>7}  理由"
     print(header)
     print("-" * 92)
     for i, sr in enumerate(shown, start=1):
         r = sr.row
         vr = "-" if sr.vol_ratio is None else f"{sr.vol_ratio:.2f}"
         print(f"{i:>4}  {r.symbol:<8}{(r.name or ''):<12}{_fmt(r.close):>10}"
-              f"{_fmt(r.change_pct):>9}{_fmt(sr.prev_high):>10}{vr:>7}{sr.score:>8.1f}  "
+              f"{_fmt(r.change_pct):>9}{_fmt(sr.prev_high):>10}{vr:>7}  "
               f"{' / '.join(sr.reasons)}")
     if top and top > 0 and len(scored) > top:
         print(f"... (其餘 {len(scored) - top} 檔已寫入 Excel)")
@@ -220,11 +220,9 @@ def main(argv=None) -> int:
     parser.add_argument("--show-pool", action="store_true",
                         help="同時印出第一層漲幅池完整排行 (預設只印一行摘要)")
     parser.add_argument("--breakout-top", type=int, default=0,
-                        help="畫面只顯示強度分前 N 名 (0=全部；Excel 一律存全部)")
+                        help="畫面只顯示前 N 名 (0=全部；Excel 一律存全部)")
     parser.add_argument("--breakout-excel", default=None,
                         help="起漲篩選結果另存 Excel 路徑 (預設不另存)")
-    parser.add_argument("--breakout-min-score", type=float, default=0.0,
-                        help="強度分下限，低於不輸出 (預設 0=只要 6 條件通過就列)")
     parser.add_argument("--breakout-vol-ratio", type=float, default=1.2,
                         help="條件3: 當日量 / 昨量 下限 (預設 1.2 倍)")
     parser.add_argument("--breakout-vol-projection", action="store_true",
@@ -251,8 +249,7 @@ def main(argv=None) -> int:
     name_map = {} if args.no_names else _load_names(args.market)
     brk_cfg = None if args.no_breakout else BreakoutConfig(
         vol_ratio_min=args.breakout_vol_ratio,
-        use_volume_projection=args.breakout_vol_projection,
-        min_score=args.breakout_min_score)
+        use_volume_projection=args.breakout_vol_projection)
     # 起漲篩選啟用時，自動確保歷史足以算 5/20 日均線與月線斜率，使用者不必另外帶 --days/--months
     if brk_cfg is not None:
         if args.days < 30:

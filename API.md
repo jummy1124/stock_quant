@@ -42,12 +42,12 @@ docker compose up -d --build
 | --- | --- | --- |
 | GET | `/health` | 存活檢查；回 `ready` / `has_snapshot` |
 | GET | `/api/meta` | 只回中繼資訊（資料時間、資料源、檔數、警告） |
-| GET | `/api/screen` | **主端點**：最新起漲個股（6 條件），依強度分排序 |
+| GET | `/api/screen` | **主端點**：最新起漲個股（6 條件） |
 | GET | `/api/pool` | 第一層漲幅池（3%~漲停前一檔），除錯/備用 |
 | GET | `/api/history/{symbol}` | **個股歷史日K**：OHLC + 成交量 + MA5/20/60（給 K 線圖用） |
 | GET | `/api/quote/{symbol}` | **個股盤中最新價**（單檔即時）：給圖表輪詢更新「今日K + 現價線」 |
 
-`/api/screen` 查詢參數：`top`（只取前 N 名，0=全部）、`min_score`（強度分下限）。
+`/api/screen` 查詢參數：`top`（只取前 N 名，0=全部）。
 `/api/pool` 查詢參數：`top`。
 `/api/history/{symbol}` 查詢參數：`months`（抓取月數 1~24，預設 6）、`market`（`TWSE`/`TPEX`，省略則自動判別）、`intraday`（`true` 時把今日盤中即時價接到日K尾端，交易時間有效；這根不進快取）。
 `/api/quote/{symbol}` 查詢參數：`market`（`TWSE`/`TPEX`，省略則自動判別）。
@@ -122,7 +122,7 @@ TTL 記憶體快取（盤後資料一天才變一次，預設 30 分鐘）。所
       "change": 9.5, "change_pct": 9.5,
       "volume": 25000, "lots": 25.0,
       "open": 101.0, "high": 110.0, "low": 100.5,
-      "score": 86.4, "prev_high": 102.0, "vol_ratio": 1.8,
+      "prev_high": 102.0, "vol_ratio": 1.8,
       "ma5": 98.2, "ma20": 95.1, "ma20_up": true,
       "reasons": ["紅K", "突破昨高102", "量比1.80", "站上5MA", "站上月線↑", "昨收<昨日5MA"]
     }

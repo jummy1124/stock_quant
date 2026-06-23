@@ -140,7 +140,7 @@ def test_breakout_and_meta_dict():
     snap, _rows, _scored = _tick_and_publish(svc)
     bd = breakout_to_dict(snap.breakout[0])
     assert bd["symbol"] == "2330"
-    assert bd["score"] >= 0 and isinstance(bd["reasons"], list) and bd["reasons"]
+    assert isinstance(bd["reasons"], list) and bd["reasons"]
     assert "ma20_up" in bd and bd["ma20_up"] is True
     md = meta_to_dict(snap, svc, count=len(snap.breakout))
     assert md["source"] == "eod" and md["count"] == 1 and md["pool_size"] == 1
@@ -172,9 +172,7 @@ def test_endpoints_if_fastapi_available():
         assert body["meta"]["source"] == "eod"
         assert body["results"] and body["results"][0]["symbol"] == "2330"
         assert body["results"][0]["market"] == "上市"
-        assert "score" in body["results"][0]
 
-        assert client.get("/api/screen?min_score=999").json()["results"] == []
         assert len(client.get("/api/screen?top=1").json()["results"]) <= 1
 
         pool = client.get("/api/pool").json()

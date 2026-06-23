@@ -10,7 +10,7 @@
   5. 站上月均線且月均線上彎  : 現價/收盤 > 20MA 且 20MA 向上 (今日 20MA > N 日前 20MA)
   6. 昨日仍在五日線下        : 前一交易日收盤 < 前一交易日的 5MA (今日才轉強上穿，鎖定當日起漲)
 
-通過的個股再依「強度分」(量增幅度 + 突破幅度 + 月線斜率) 由高到低排序。
+通過 6 條件的個股即入選，依評估順序輸出 (不另做排序)。
 
 資料直接來自 ranker (RankRow + ranker.history())，不經 Excel 中轉。
 歷史K不足以算某條均線時，該條件自動略過 (不誤殺)；預設 --days 已確保足夠。
@@ -40,8 +40,6 @@ class BreakoutConfig:
     #               True =先把當日量換算成全日預估量再比 (盤中早盤較公允)
     use_volume_projection: bool = False
 
-    min_score: float = 0.0                 # 強度分下限 (低於不輸出，預設 0=只要 6 條通過就列)
-
     # --- 台股交易時段 (use_volume_projection=True 時換算用) ---
     session_start: time = time(9, 0)
     session_end: time = time(13, 30)
@@ -51,7 +49,6 @@ class BreakoutConfig:
 class ScoredRow:
     """一檔通過 6 條件的個股 + 明細。"""
     row: object                  # 原始 RankRow
-    score: float                 # 強度分 0~100 (僅供排序)
     prev_high: Optional[float]   # 昨日最高 (條件2 基準)
     vol_ratio: Optional[float]   # 當日量 / 昨量
     ma5: Optional[float]
@@ -208,21 +205,7 @@ def _evaluate(ranker, row, now, cfg: BreakoutConfig) -> Optional[ScoredRow]:
     else:
         return None                          # 昨日已在五日線上 -> 非當日起漲
 
-    # --- 強度分 (僅供排序): 量增幅度 + 突破幅度 + 月線斜率 ---
-    if vol_ratio is None:
-        s_vol = 20.0
-    else:
-        s_vol = max(0.0, min(1.0, (vol_ratio - cfg.vol_ratio_min) / (3.0 - cfg.vol_ratio_min))) * 40.0
-    margin = (price - prev_high) / prev_high
-    s_break = max(0.0, min(1.0, margin / 0.05)) * 30.0
-    if ma20 is not None and ma20_prev:
-        slope = (ma20 - ma20_prev) / ma20_prev
-        s_trend = max(0.0, min(1.0, slope / 0.03)) * 30.0
-    else:
-        s_trend = 15.0
-    score = round(s_vol + s_break + s_trend, 1)
-
-    return ScoredRow(row=row, score=score, prev_high=prev_high,
+    return ScoredRow(row=row, prev_high=prev_high,
                      vol_ratio=(round(vol_ratio, 2) if vol_ratio is not None else None),
                      ma5=(round(ma5, 2) if ma5 is not None else None),
                      ma20=(round(ma20, 2) if ma20 is not None else None),
@@ -235,15 +218,14 @@ def _evaluate(ranker, row, now, cfg: BreakoutConfig) -> Optional[ScoredRow]:
 
 def screen_breakout(ranker, rows: Sequence, now: Optional[datetime] = None,
                     cfg: Optional[BreakoutConfig] = None) -> list:
-    """對 ranker.tick() 的結果做 6 條件起漲篩選，回傳依強度分由高到低的 ScoredRow 清單。"""
+    """對 ranker.tick() 的結果做 6 條件起漲篩選，回傳 ScoredRow 清單 (依評估順序)。"""
     cfg = cfg or BreakoutConfig()
     now = now or datetime.now()
     out: list[ScoredRow] = []
     for row in rows:
         sr = _evaluate(ranker, row, now, cfg)
-        if sr is not None and sr.score >= cfg.min_score:
+        if sr is not None:
             out.append(sr)
-    out.sort(key=lambda s: s.score, reverse=True)
     return out
 
 
@@ -252,7 +234,7 @@ def screen_breakout(ranker, rows: Sequence, now: Optional[datetime] = None,
 # ============================================================
 
 _HEADERS = ["排名", "代號", "名稱", "市場", "現價", "漲幅%", "昨高", "量比",
-            "5MA", "月線(20MA)", "月線上彎", "強度分", "理由"]
+            "5MA", "月線(20MA)", "月線上彎", "理由"]
 
 
 def save_breakout(path: str, now: datetime, scored: Sequence,
@@ -286,7 +268,7 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
             r = sr.row
             ws.append([i, r.symbol, r.name, r.market.zh, r.close, r.change_pct,
                        sr.prev_high, sr.vol_ratio, sr.ma5, sr.ma20,
-                       "↑" if sr.ma20_up else "", sr.score, " / ".join(sr.reasons)])
+                       "↑" if sr.ma20_up else "", " / ".join(sr.reasons)])
 
         # 數字格式 (資料從第 3 列開始: 1=標題, 2=表頭)
         first = 3
@@ -297,11 +279,10 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
                     c.number_format = "0.00"
                 row[5].number_format = "0.00"                # 漲幅%
                 row[7].number_format = "0.00"                # 量比
-                row[11].number_format = "0.0"                # 強度分
                 row[10].alignment = Alignment(horizontal="center")  # 月線上彎
 
         # 欄寬 + 凍結標題與表頭
-        widths = [6, 8, 12, 6, 9, 8, 9, 7, 9, 11, 9, 8, 40]
+        widths = [6, 8, 12, 6, 9, 8, 9, 7, 9, 11, 9, 40]
         for idx, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = w
         ws.freeze_panes = "A3"
