@@ -13,11 +13,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from multiprocessing import Pool
 from typing import Optional, Sequence
 
 from .datasource import get_history
+from .datasource.market_history import fetch_market_eod
 from .datasource.mis import fetch_realtime
 from .domain import DailyQuote, Market
 from .limits import limit_up_prev_tick
@@ -42,6 +43,7 @@ class RankRow:
     open: Optional[float] = None
     high: Optional[float] = None
     low: Optional[float] = None
+    trade_date: Optional[date] = None  # 這筆「今日K/現價」對應的交易日 (供前端確認資料日期)
 
     @property
     def lots(self) -> Optional[float]:
@@ -104,6 +106,7 @@ class IntradayRanker:
         self.exclude_limit_up = exclude_limit_up
         self.name_map = name_map or {}
         self._history: dict[str, list[DailyQuote]] = {}
+        self._eod_day: Optional[date] = None   # 已併入「今日完成日K」的交易日 (避免重抓重併)
         self.last_quoted = 0          # 上次 tick 實際取得即時價/可算漲幅的檔數 (覆蓋率診斷)
         self.last_matched = 0         # 上次 tick 通過篩選的檔數
         self.last_warning: Optional[str] = None   # 上次 tick 的即時報價失敗摘要 (若有)
@@ -217,10 +220,48 @@ class IntradayRanker:
             out.append(self._row(symbol, lq.market, name, lq, prev_close, close))
         return out
 
+    def _merge_eod_today(self, day: date) -> int:
+        """盤後把『今日完成日K』(全市場) 併入歷史，使 history[-1] = 今日。
+
+        修正先前「收盤後仍顯示昨日」的問題: 全市場歷史 (market_history) 刻意跳過今天、
+        且只在啟動載一次，故收盤後 EOD 模式用的 history[-1] 其實是昨日。這裡在收盤後
+        補抓今日完成日K (來源與歷史一致、且做日期核對) 併入，讓 history[-1] 變回今日。
+
+        一天只抓併一次 (self._eod_day)。今日資料尚未公布 / 假日 / 抓取失敗時 **不動歷史**，
+        下個 cycle 會再試 —— 此時 EOD 仍 fallback 顯示最後一個已完成交易日 (原行為)。
+        回傳本次新併入的檔數。
+        """
+        if self._eod_day == day:
+            return 0
+        markets = {m.name.lower() for _s, m in self.pairs if m is not None} or {"twse", "tpex"}
+        try:
+            eod = fetch_market_eod(tuple(sorted(markets)), day)
+        except Exception as exc:                        # noqa: BLE001 — 抓取失敗不致命
+            self.last_warning = f"盤後當日完成日K抓取失敗: {type(exc).__name__}: {exc}"
+            return 0
+        if not eod:
+            return 0                                    # 今日尚未公布 -> 保持原狀，下次再試
+        merged = 0
+        for symbol, q in eod.items():
+            hist = self._history.get(symbol)
+            if not hist:
+                continue                                # 無歷史(昨收) 就無從算漲幅，略過
+            if hist[-1].trade_date >= day:
+                continue                                # 今日已在歷史中 -> 不重複併入
+            hist.append(q)
+            merged += 1
+        self._eod_day = day
+        return merged
+
     def _tick_eod(self, now: datetime) -> list[RankRow]:
-        """非交易時間: 用最後一個交易日的完成日K (history[-1])，與前一日算漲幅。"""
+        """非交易時間: 用最後一個交易日的完成日K (history[-1])，與前一日算漲幅。
+
+        收盤後先補抓並併入『今日完成日K』(_merge_eod_today)，使 history[-1] = 今日；
+        今日尚未公布時則 fallback 用最後一個已完成交易日。
+        """
         self.last_source = "eod"
         self.last_warning = None
+        self._merge_eod_today(now.date())               # 盤後併入今日完成日K (一天一次)
         out: list[RankRow] = []
         for symbol, market in self.pairs:
             hist = self._history.get(symbol)
@@ -244,4 +285,5 @@ class IntradayRanker:
             change_pct=round(cp, 2) if cp is not None else None,
             volume=q.volume,
             open=_f(q.open), high=_f(q.high), low=_f(q.low),
+            trade_date=getattr(q, "trade_date", None),
         )

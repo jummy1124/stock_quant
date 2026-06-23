@@ -57,6 +57,8 @@ class StockRow(BaseModel):
     open: Optional[float] = None
     high: Optional[float] = None
     low: Optional[float] = None
+    trade_date: Optional[str] = Field(
+        None, description="此『現價/今日K』對應的交易日 YYYY-MM-DD (前端可確認非昨日)")
 
 
 class BreakoutRow(StockRow):
