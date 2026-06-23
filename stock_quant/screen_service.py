@@ -146,6 +146,8 @@ def stock_to_dict(r: RankRow) -> dict:
         close=r.close, prev_close=r.prev_close, change=r.change,
         change_pct=r.change_pct, volume=r.volume, lots=r.lots,
         open=r.open, high=r.high, low=r.low,
+        trade_date=(r.trade_date.isoformat()
+                    if getattr(r, "trade_date", None) is not None else None),
     )
 
 

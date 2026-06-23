@@ -185,6 +185,8 @@ def test_ranker_tick_eod_when_closed(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("非交易時間不該抓即時價")
     monkeypatch.setattr(intraday_mod, "fetch_realtime", _boom)
+    # 今日(6/5)完成K已在歷史中 -> EOD 不需另抓 (回空，避免測試打網路)
+    monkeypatch.setattr(intraday_mod, "fetch_market_eod", lambda *a, **k: {})
 
     base = date(2026, 6, 5)
     rk = IntradayRanker([("2330", Market.TWSE)], processes=1, apply_filter=False)
@@ -194,6 +196,60 @@ def test_ranker_tick_eod_when_closed(monkeypatch):
     assert rk.last_source == "eod"
     assert len(rows) == 1 and rows[0].change_pct == 8.0
     assert rows[0].stable is True
+
+
+# ---- 盤後: 補抓今日完成日K併入歷史，使 history[-1] = 今日 (修正顯示昨日的問題) ----
+def test_ranker_eod_merges_today_close(monkeypatch):
+    """收盤後 history 只到昨日(6/22)時，應補抓今日(6/23)完成K併入並用它算漲幅。"""
+    monkeypatch.setattr(intraday_mod, "fetch_realtime",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("不該抓即時價")))
+    yday, today = date(2026, 6, 22), date(2026, 6, 23)
+    rk = IntradayRanker([("8028", Market.TWSE)], processes=1, apply_filter=False)
+    rk._history["8028"] = [_bar("8028", yday, 311.5, 9000, name="昇陽半導體")]  # 只有昨日
+
+    captured = {}
+    def fake_eod(markets, day, **k):
+        captured["markets"], captured["day"] = markets, day
+        return {"8028": _bar("8028", today, 322.5, 11432, name="昇陽半導體")}
+    monkeypatch.setattr(intraday_mod, "fetch_market_eod", fake_eod)
+
+    rows = rk.tick(datetime(2026, 6, 23, 15, 0))
+    assert rk.last_source == "eod"
+    assert captured["day"] == today and captured["markets"] == ("twse",)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.close == 322.5 and r.prev_close == 311.5
+    assert r.change == 11.0 and r.trade_date == today      # 顯示的是今日(6/23)資料
+    assert rk._history["8028"][-1].trade_date == today     # 已併入歷史
+    assert len(rk._history["8028"]) == 2
+
+
+def test_ranker_eod_no_today_data_fallback(monkeypatch):
+    """今日尚未公布 (fetch_market_eod 回空) -> fallback 用最後一個已完成交易日，不亂併。"""
+    monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda *a, **k: [])
+    monkeypatch.setattr(intraday_mod, "fetch_market_eod", lambda *a, **k: {})
+    d1, d2 = date(2026, 6, 19), date(2026, 6, 20)
+    rk = IntradayRanker([("8028", Market.TWSE)], processes=1, apply_filter=False)
+    rk._history["8028"] = [_bar("8028", d1, 100, 1000), _bar("8028", d2, 108, 1500)]
+    rows = rk.tick(datetime(2026, 6, 23, 15, 0))
+    assert len(rows) == 1 and rows[0].change_pct == 8.0    # 仍用 d2 vs d1
+    assert rows[0].trade_date == d2
+    assert len(rk._history["8028"]) == 2                   # 未被亂加
+    assert rk._eod_day is None                             # 沒抓到不標記，下次會再試
+
+
+def test_ranker_eod_no_duplicate_merge(monkeypatch):
+    """今日已在歷史中時，再抓到同一天也不重複併入。"""
+    monkeypatch.setattr(intraday_mod, "fetch_realtime", lambda *a, **k: [])
+    yday, today = date(2026, 6, 22), date(2026, 6, 23)
+    rk = IntradayRanker([("8028", Market.TWSE)], processes=1, apply_filter=False)
+    rk._history["8028"] = [_bar("8028", yday, 311.5, 9000),
+                           _bar("8028", today, 322.5, 11432)]   # 今日已在
+    monkeypatch.setattr(intraday_mod, "fetch_market_eod",
+                        lambda *a, **k: {"8028": _bar("8028", today, 999, 1)})
+    rows = rk.tick(datetime(2026, 6, 23, 15, 0))
+    assert len(rk._history["8028"]) == 2                   # 沒被加成 3 根
+    assert rows[0].close == 322.5                          # 用原本的今日K，不是 999
 
 
 def test_ranker_tick_eod_can_be_disabled(monkeypatch):

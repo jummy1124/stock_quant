@@ -89,6 +89,40 @@ def fetch_twse_day(d: date, timeout: float = 10.0) -> list[DailyQuote]:
     return []
 
 
+def fetch_market_eod(
+    markets: Sequence[str],
+    day: date,
+    timeout: float = 10.0,
+) -> dict[str, DailyQuote]:
+    """抓某一交易日『全市場完成日K』，回傳 {代號: DailyQuote}。
+
+    給盤後 (EOD) 模式用: 收盤後當日完成日K公布後即可取得「今日」收盤，
+    併入歷史讓 history[-1] = 今日 (而非沿用昨日)。
+
+    來源與歷史快取一致 —— 上市用 MI_INDEX (指定日期)、上櫃用 TPEx 每日收盤行情。
+    **僅回傳『交易日 == day』的資料**；當日尚未公布 / 假日 / 抓取失敗時該市場回空
+    (絕不混入舊資料)，呼叫端應據此 fallback 到最後一個已完成交易日。
+    """
+    out: dict[str, DailyQuote] = {}
+    if "twse" in markets:
+        try:
+            for q in fetch_twse_day(day, timeout=timeout):
+                if q.trade_date == day and q.is_valid():
+                    out[q.symbol] = q
+        except Exception:                       # noqa: BLE001 — 抓不到就回空、由上層 fallback
+            pass
+    if "tpex" in markets:
+        from .tpex import TpexDataSource
+        try:
+            src = TpexDataSource(timeout=max(timeout, 20.0))
+            for q in src.fetch(src.list_fetch_units()[0]):
+                if q.trade_date == day and q.is_valid():
+                    out[q.symbol] = q
+        except Exception:                       # noqa: BLE001
+            pass
+    return out
+
+
 def _weekdays_back(today: date, max_attempts: int):
     d = today - timedelta(days=1)   # 從昨天起 (今天盤中由 MIS 提供)
     for _ in range(max_attempts):
