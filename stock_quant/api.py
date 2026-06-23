@@ -50,7 +50,6 @@ class BreakoutRow(StockRow):
     ma5: Optional[float] = None
     ma20: Optional[float] = Field(None, description="月均線")
     ma20_up: bool = Field(False, description="月均線是否上彎")
-    reasons: list[str] = Field(default_factory=list, description="入選理由")
 
 
 class Meta(BaseModel):

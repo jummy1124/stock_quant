@@ -19,7 +19,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Optional, Sequence
 
@@ -54,7 +54,6 @@ class ScoredRow:
     ma5: Optional[float]
     ma20: Optional[float]
     ma20_up: bool                # 月均線是否上彎
-    reasons: list = field(default_factory=list)   # 入選理由 (印出用)
 
 
 # ============================================================
@@ -134,82 +133,57 @@ def _evaluate(ranker, row, now, cfg: BreakoutConfig) -> Optional[ScoredRow]:
 
     closes = _ma_closes(ranker, row)            # 均線用完成日K (盤中不含今日現價)
     prev_high, prev_vol = _prev_high_and_vol(ranker, row)
-    reasons = []
 
-    # 條件1: 紅K (現價/收盤 > 開盤)
-    if op is None:
-        reasons.append("紅K(無開盤價,略過)")
-    elif price > op:
-        reasons.append("紅K")
-    else:
+    # 條件1: 紅K (現價/收盤 > 開盤)；無開盤價則略過此條
+    if op is not None and price <= op:
         return None
 
     # 條件2: 突破前一交易日最高點
-    if prev_high is None:
-        return None                          # 沒有昨高就無法判斷起漲核心，剔除
-    if price > prev_high:
-        reasons.append(f"突破昨高{prev_high:g}")
-    else:
-        return None
+    if prev_high is None or price <= prev_high:
+        return None                          # 沒有昨高或未突破，剔除
 
-    # 條件3: 當日量 > 昨量 × 1.2
+    # 條件3: 當日量 > 昨量 × 1.2 (無昨量/今量則略過此條)
     vol_ratio = None
     if prev_vol and getattr(row, "volume", None) is not None:
         today_vol = float(row.volume)
         if cfg.use_volume_projection:
             today_vol /= _elapsed_fraction(now, cfg)
         vol_ratio = today_vol / prev_vol
-        if vol_ratio >= cfg.vol_ratio_min:
-            reasons.append(f"量比{vol_ratio:.2f}")
-        else:
+        if vol_ratio < cfg.vol_ratio_min:
             return None
-    else:
-        reasons.append("量能(無昨量/今量,略過)")
 
-    # 條件4: 站上五日均價 (5MA)
+    # 條件4: 站上五日均價 (5MA)；歷史不足則略過此條
     ma5 = _ma(closes, cfg.ma_short)
-    if ma5 is None:
-        reasons.append("5MA(歷史不足,略過)")
-    elif price > ma5:
-        reasons.append("站上5MA")
-    else:
+    if ma5 is not None and price <= ma5:
         return None
 
-    # 條件5: 站上月均線且月均線上彎 (20MA)
+    # 條件5: 站上月均線且月均線上彎 (20MA)；歷史不足則略過此條
     ma20 = _ma(closes, cfg.ma_mid)
     lb = cfg.ma_mid_slope_lookback
     ma20_prev = _ma(closes[:-lb], cfg.ma_mid) if lb > 0 and len(closes) > cfg.ma_mid + lb else None
     ma20_up = False
-    if ma20 is None:
-        reasons.append("月線(歷史不足,略過)")
-    else:
+    if ma20 is not None:
         if price <= ma20:
             return None
-        if ma20_prev is None:
-            reasons.append("站上月線(斜率不足,略過上彎判斷)")
-        elif ma20 > ma20_prev:
-            ma20_up = True
-            reasons.append("站上月線↑")
-        else:
-            return None                      # 月線未上彎
+        if ma20_prev is not None:
+            if ma20 > ma20_prev:
+                ma20_up = True
+            else:
+                return None                  # 月線未上彎
 
     # 條件6: 前一交易日收盤 < 前一交易日的 5MA (昨日仍在五日線下，今日才轉強上穿)
     prev_seq = _closes_through_yesterday(ranker, row)
     ma5_prev = _ma(prev_seq, cfg.ma_short)
     prev_close = float(row.prev_close) if getattr(row, "prev_close", None) is not None \
         else (prev_seq[-1] if prev_seq else None)
-    if ma5_prev is None or prev_close is None:
-        reasons.append("昨日5MA(歷史不足,略過)")
-    elif prev_close < ma5_prev:
-        reasons.append("昨收<昨日5MA")
-    else:
+    if ma5_prev is not None and prev_close is not None and prev_close >= ma5_prev:
         return None                          # 昨日已在五日線上 -> 非當日起漲
 
     return ScoredRow(row=row, prev_high=prev_high,
                      vol_ratio=(round(vol_ratio, 2) if vol_ratio is not None else None),
                      ma5=(round(ma5, 2) if ma5 is not None else None),
                      ma20=(round(ma20, 2) if ma20 is not None else None),
-                     ma20_up=ma20_up, reasons=reasons)
+                     ma20_up=ma20_up)
 
 
 # ============================================================
@@ -234,7 +208,7 @@ def screen_breakout(ranker, rows: Sequence, now: Optional[datetime] = None,
 # ============================================================
 
 _HEADERS = ["排名", "代號", "名稱", "市場", "現價", "漲幅%", "昨高", "量比",
-            "5MA", "月線(20MA)", "月線上彎", "理由"]
+            "5MA", "月線(20MA)", "月線上彎"]
 
 
 def save_breakout(path: str, now: datetime, scored: Sequence,
@@ -268,7 +242,7 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
             r = sr.row
             ws.append([i, r.symbol, r.name, r.market.zh, r.close, r.change_pct,
                        sr.prev_high, sr.vol_ratio, sr.ma5, sr.ma20,
-                       "↑" if sr.ma20_up else "", " / ".join(sr.reasons)])
+                       "↑" if sr.ma20_up else ""])
 
         # 數字格式 (資料從第 3 列開始: 1=標題, 2=表頭)
         first = 3
@@ -282,7 +256,7 @@ def save_breakout(path: str, now: datetime, scored: Sequence,
                 row[10].alignment = Alignment(horizontal="center")  # 月線上彎
 
         # 欄寬 + 凍結標題與表頭
-        widths = [6, 8, 12, 6, 9, 8, 9, 7, 9, 11, 9, 40]
+        widths = [6, 8, 12, 6, 9, 8, 9, 7, 9, 11, 9]
         for idx, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = w
         ws.freeze_panes = "A3"

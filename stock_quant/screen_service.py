@@ -129,7 +129,7 @@ def breakout_to_dict(sr: ScoredRow) -> dict:
     d = stock_to_dict(sr.row)
     d.update(
         prev_high=sr.prev_high, vol_ratio=sr.vol_ratio,
-        ma5=sr.ma5, ma20=sr.ma20, ma20_up=sr.ma20_up, reasons=list(sr.reasons),
+        ma5=sr.ma5, ma20=sr.ma20, ma20_up=sr.ma20_up,
     )
     return d
 

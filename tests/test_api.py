@@ -140,7 +140,6 @@ def test_breakout_and_meta_dict():
     snap, _rows, _scored = _tick_and_publish(svc)
     bd = breakout_to_dict(snap.breakout[0])
     assert bd["symbol"] == "2330"
-    assert isinstance(bd["reasons"], list) and bd["reasons"]
     assert "ma20_up" in bd and bd["ma20_up"] is True
     md = meta_to_dict(snap, svc, count=len(snap.breakout))
     assert md["source"] == "eod" and md["count"] == 1 and md["pool_size"] == 1

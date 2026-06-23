@@ -107,15 +107,14 @@ def _print_breakout(now: datetime, scored, source: str = "live", top: int = 0,
         print("(目前沒有符合起漲條件的個股)")
         return
     shown = scored[:top] if top and top > 0 else scored
-    header = f"{'#':>4}  {'代號':<8}{'名稱':<12}{'現價':>10}{'漲幅%':>9}{'昨高':>10}{'量比':>7}  理由"
+    header = f"{'#':>4}  {'代號':<8}{'名稱':<12}{'現價':>10}{'漲幅%':>9}{'昨高':>10}{'量比':>7}"
     print(header)
     print("-" * 92)
     for i, sr in enumerate(shown, start=1):
         r = sr.row
         vr = "-" if sr.vol_ratio is None else f"{sr.vol_ratio:.2f}"
         print(f"{i:>4}  {r.symbol:<8}{(r.name or ''):<12}{_fmt(r.close):>10}"
-              f"{_fmt(r.change_pct):>9}{_fmt(sr.prev_high):>10}{vr:>7}  "
-              f"{' / '.join(sr.reasons)}")
+              f"{_fmt(r.change_pct):>9}{_fmt(sr.prev_high):>10}{vr:>7}")
     if top and top > 0 and len(scored) > top:
         print(f"... (其餘 {len(scored) - top} 檔已寫入 Excel)")
 
