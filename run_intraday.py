@@ -43,6 +43,7 @@ from stock_quant.breakout_screen import BreakoutConfig, save_breakout, screen_br
 from stock_quant.datasource import load_market_history
 from stock_quant.domain import Market
 from stock_quant.excel_export import save_ranking
+from stock_quant.ingest import IngestConfig, SnapshotIngestor
 from stock_quant.intraday import IntradayRanker
 from stock_quant.netinfo import push_startup_ip
 from stock_quant.notify import DailyDigestAlerter, LineNotifier, StableAlerter, load_dotenv
@@ -133,6 +134,24 @@ def _build_alerter(enabled: bool, mode: str, notify_time: time):
         return StableAlerter(notifier)
     print(f"LINE 推播: 每日 {notify_time:%H:%M} 推當下篩選快照 (收訊者 {len(notifier.user_ids)} 人)")
     return DailyDigestAlerter(notifier, fire_time=notify_time)
+
+
+def _build_ingestor(args):
+    """--ingest 時建立上傳器；缺 INGEST_URL / INGEST_TOKEN 則停用並提示。"""
+    if not args.ingest:
+        return None
+    cfg = IngestConfig.from_env()
+    if args.ingest_url:
+        cfg.base_url = args.ingest_url
+    if args.ingest_token:
+        cfg.token = args.ingest_token
+    if not cfg.configured:
+        print("⚠️ 已指定 --ingest，但缺 INGEST_URL / INGEST_TOKEN "
+              "(.env、環境變數或 --ingest-url/--ingest-token) -> 暫不上傳。")
+        return None
+    fire = _parse_hhmm(args.ingest_time)
+    print(f"📤 篩選快照上傳已啟用: {cfg.base_url} (盤中快照 {fire:%H:%M}；收盤後每交易日一次)")
+    return SnapshotIngestor(cfg, fire_time=fire)
 
 
 def _load_names(market_arg: str) -> dict:
@@ -233,6 +252,15 @@ def main(argv=None) -> int:
     parser.add_argument("--api-port", type=int, default=8000, help="API 監聽埠 (預設 8000)")
     parser.add_argument("--api-origins", default=None,
                         help="API CORS 允許來源，逗號分隔 (前端在別網域時設；預設 * 或 ALLOWED_ORIGINS)")
+    # --- 上傳每日篩選快照到 userdata 後端 (供下載頁) ---
+    parser.add_argument("--ingest", action="store_true",
+                        help="把每日篩選結果上傳到 userdata 後端 (需設 INGEST_URL / INGEST_TOKEN)")
+    parser.add_argument("--ingest-url", default=None,
+                        help="userdata 後端位址，例 http://localhost:8100 (預設讀環境變數 INGEST_URL)")
+    parser.add_argument("--ingest-token", default=None,
+                        help="ingestion 服務 token (預設讀環境變數 INGEST_TOKEN)")
+    parser.add_argument("--ingest-time", default="13:00",
+                        help="盤中快照 (intraday_1300) 的上傳時間 HH:MM (預設 13:00)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (盤中=即時 / 非盤中=最後交易日)")
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
@@ -241,6 +269,7 @@ def main(argv=None) -> int:
     market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
+    ingestor = _build_ingestor(args)
     if args.notify_ip_on_start:                      # 開機(=app 啟動)推一次當日對外 IP
         push_startup_ip(LineNotifier())
     use_eod = not args.no_screen_when_closed       # 非交易時間是否用最後交易日資料
@@ -346,6 +375,9 @@ def main(argv=None) -> int:
         # raw=未過濾原始列，供 API 依使用者參數即時重算漲幅池/起漲篩選。
         if api_service is not None:
             api_service.publish(now, rows, scored, raw=raw)
+        # 上傳當日篩選快照 (盤中 13:00 / 收盤後)；同日同 session 去重，失敗不中斷。
+        if ingestor is not None:
+            ingestor.process(now, scored, rows, ranker)
 
     if args.once:
         _cycle(datetime.now())
