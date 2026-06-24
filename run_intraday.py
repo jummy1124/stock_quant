@@ -166,9 +166,12 @@ def _load_names(market_arg: str) -> dict:
         return {}
 
 
-def _start_api_server(ranker, host: str, port: int, origins):
+def _start_api_server(host: str, port: int, origins):
     """合併單一進程: 在背景 thread 起 uvicorn，API 只讀本進程每分鐘 publish 的快照
-    (不自行抓即時價 -> 零重複爬取)。回傳 (service, error)；缺 fastapi/uvicorn 回 (None, msg)。"""
+    (不自行抓即時價 -> 零重複爬取)。回傳 (service, error)；缺 fastapi/uvicorn 回 (None, msg)。
+
+    先起 server 讓 /health 立即就緒 (liveness)；ranker 由 main 在歷史備妥後再
+    attach_ranker() 接上 (readiness)，健康檢查不必等待全市場歷史 bootstrap。"""
     try:
         import threading
 
@@ -183,8 +186,7 @@ def _start_api_server(ranker, host: str, port: int, origins):
     cfg = ApiConfig.from_env()
     if origins:
         cfg.allowed_origins = tuple(o.strip() for o in origins.split(",") if o.strip()) or ("*",)
-    service = ScreenService(cfg)
-    service.attach_ranker(ranker)               # 沿用本進程已建好的 ranker
+    service = ScreenService(cfg)               # ranker 由 main 稍後 attach_ranker() 接上
     app = create_app(service=service)
 
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
@@ -270,6 +272,17 @@ def main(argv=None) -> int:
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
     ingestor = _build_ingestor(args)
+    # 先把內嵌 API 起起來，讓 /health 立即就緒 (liveness)，不必等下面 (可能很慢的)
+    # 名稱對照 + 全市場歷史 bootstrap；ranker 備妥後再 attach。避免部署冷啟動時
+    # 健康檢查在 90s 內等不到 /health 而誤判失敗、觸發回滾。
+    api_service = None
+    if args.serve:
+        api_service, api_err = _start_api_server(args.api_host, args.api_port, args.api_origins)
+        if api_err:
+            print(f"⚠️ {api_err}")
+        else:
+            print(f"🌐 內嵌 API 已啟動: http://{args.api_host}:{args.api_port}  "
+                  f"(/health 已就緒；歷史載入中，/api/screen 待備妥)")
     if args.notify_ip_on_start:                      # 開機(=app 啟動)推一次當日對外 IP
         push_startup_ip(LineNotifier())
     use_eod = not args.no_screen_when_closed       # 非交易時間是否用最後交易日資料
@@ -321,17 +334,12 @@ def main(argv=None) -> int:
         print("沒有歷史資料，請檢查網路或改用 --limit / 指定個股測試。")
         return 1
 
-    api_service = None
-    if args.serve:
-        api_service, api_err = _start_api_server(ranker, args.api_host, args.api_port,
-                                                 args.api_origins)
-        if api_err:
-            print(f"⚠️ {api_err}")
-        else:
-            print(f"🌐 內嵌 API 已啟動: http://{args.api_host}:{args.api_port}  "
-                  f"(Swagger: /docs；前端輪詢 GET /api/screen)")
-            if args.once:
-                print("ℹ️ --once 會跑完一次即結束，API 不會常駐；要持續服務請拿掉 --once。")
+    # 歷史備妥 -> 把 ranker 接到已在跑的 API service (readiness)；之後每分鐘 publish。
+    if api_service is not None:
+        api_service.attach_ranker(ranker)
+        print("🔌 API 已接上資料 (Swagger: /docs；前端輪詢 GET /api/screen)")
+        if args.once:
+            print("ℹ️ --once 會跑完一次即結束，API 不會常駐；要持續服務請拿掉 --once。")
 
     def _cycle(now: datetime) -> None:
         # --serve 時取「未過濾原始列」存進快照，讓 API 端依使用者參數即時重算
