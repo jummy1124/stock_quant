@@ -9,8 +9,14 @@ services:
     environment:
       TZ: Asia/Taipei
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      # 上傳每日篩選快照到同一台 VM 上的 userdata 後端 (它把 8100 publish 在 host)。
+      # 容器內以 host.docker.internal 連回 host；INGEST_TOKEN 由 .env 提供 (需與後端一致)。
+      INGEST_URL: ${INGEST_URL:-http://host.docker.internal:8100}
     env_file:
       - .env
+    # 讓容器內能用 host.docker.internal 解析到 VM host (連後端的 8100)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:
@@ -18,7 +24,8 @@ services:
       - ./data:/app/data
     # 與開發 compose 一致：常駐每分鐘篩選 + 內嵌 API(/health 用) + 每日 LINE 推播
     # --notify-ip-on-start：VM 每日開機 -> 容器自動重啟 -> 啟動時推一則當日對外 IP
-    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line", "--notify-ip-on-start"]
+    # --ingest：每交易日 13:00 + 收盤後把篩選結果 POST 到 userdata 後端 (INGEST_URL/INGEST_TOKEN)
+    command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line", "--notify-ip-on-start", "--ingest"]
     restart: unless-stopped
 
 volumes:
