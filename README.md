@@ -1,88 +1,258 @@
-# stock_quant — 台股盤中漲幅篩選 (盤中即時 + 盤後)
+# Stock Quant — Taiwan-Stock Intraday Breakout Screener (Engine)
 
-> 🐳 **部署**：用 Poetry 管環境、Docker 打包。`cp .env.example .env` 後 `docker compose up -d --build` 即可。詳見 [`DEPLOY.md`](DEPLOY.md)。
+> Real-time + end-of-day screening engine for the Taiwan stock market. It scans the
+> **entire market every minute** during trading hours, finds stocks that are *starting
+> to break out*, and serves the results over a small HTTP API, an Excel file, and
+> optional LINE push notifications.
 
-物件導向、分層、依賴反轉。**篩出「漲幅 3% ~ 漲停前一檔」的個股**，依漲幅由大到小排序，
-多進程平行抓即時價。只看普通個股（ETF/權證/特別股/期貨等濾掉）。單一進入點 `run_intraday.py`：
+**Tech:** Python 3.10+ · Poetry · FastAPI (embedded, optional) · multiprocessing · Docker
 
-- **交易時間（週一至五 09:00–13:30）**：**每分鐘**用 MIS 即時價當「今日K」算漲幅 → 篩選 → print（含股票名稱）+ 寫 Excel，可選 LINE 推播。
-- **非交易時間（盤後／開盤前／假日）**：改用**最後一個交易日的完成日K**算漲幅（`--no-screen-when-closed` 可關閉）。
+> ⚠️ The screening output is probabilistic, lagging, reference information only — **not investment advice.**
 
-## 漲幅與篩選
+This is the **data/compute engine** of a three-part system. The companion repositories are
+`stock_quant_backend` (user accounts & saved records) and
+[`stock_quant_frontend`](https://github.com/jummy1124/stock_quant_frontend) (the React UI).
 
-對每檔有「昨收」與「今日現價」的個股計算 `漲幅% = (今收 − 昨收) / 昨收 × 100`，並套用篩選：
+---
 
-1. **漲幅 ≥ 3%**（`--min-change` 可調）
-2. **收盤 ≤ 漲停前一檔**：用台股升降單位算漲停價，再往下一檔；排除已鎖漲停（`--include-limit-up` 可納入）
+## Why I built it
 
-通過的個股依漲幅由大到小排序。`--no-filter` 可關閉篩選、輸出全市場漲幅排行。
+Manually watching a 1,900-stock market for intraday breakouts is impossible. I wanted a
+system that does the watching for me: every minute it pulls live quotes for the whole
+market, applies a disciplined, rule-based breakout filter, and surfaces only the handful
+of names worth a look — with the same logic available as a CLI, an Excel report, a push
+notification, and a JSON API a web UI can poll.
 
-**股票名稱**：啟動時用 EOD OpenAPI（含中文名稱）建立 `{代號:名稱}` 對照，補上輸出的股票名稱
-（即時/歷史端點常不附名稱）；`--no-names` 可略過。
+The interesting engineering is **doing this reliably against rate-limited public data
+sources** without hammering them, and making a single run serve four different consumers
+without ever fetching the same quote twice.
 
-> ⚠️ 成交量單位已統一為「股」（MIS 即時與 TPEx 歷史的「張」會 ×1000 轉換）；顯示時再換回「張」。
-> 技術面/漲幅篩選為機率性參考、會落後，**非投資建議**。
+## Highlights
 
-即時報價抓取對 MIS 限流做了**單批錯誤隔離**：切數十批平行抓，單批限流/逾時不會拖垮整次掃描，並回報「N/總批 失敗」覆蓋率警告。
+- **Two-stage, fully rule-based screen** (no black box): a "gainer pool" pre-filter,
+  then 6 hard breakout conditions — easy to explain in an interview and easy to test.
+- **One process, four outputs.** A single per-minute tick feeds the console, Excel, LINE,
+  and the embedded HTTP API from the *same* snapshot — zero duplicate crawling.
+- **Resilient data ingestion.** Whole-market fetches are batched across processes with
+  **per-batch error isolation**, exponential back-off, and an **incremental on-disk cache**
+  so a rate-limit on one batch never sinks the whole scan.
+- **Automatic live ⇄ end-of-day switching** based on a Taipei-timezone market clock.
+- **Clean layering** (domain → datasource → engine → delivery) with dependency inversion,
+  so the core logic has zero web/DB/vendor imports and is trivially unit-testable.
+- **Zero-dependency test runner** — the full suite runs with the standard library only.
 
-## Excel 輸出
+## System architecture
 
-每個 cycle 用 `openpyxl` 把符合的個股覆蓋寫入同一個 `ranking.xlsx`（排名、代號、名稱、市場、現價、漲跌、漲幅%、量、開高低、昨收）。
-`--excel PATH` 改路徑、`--no-excel` 關閉。檔案被 Excel 開著鎖住時會略過該次、不中斷迴圈。
-依賴：標準函式庫 + `openpyxl`（`pip install openpyxl`）。
+```mermaid
+flowchart LR
+    subgraph SRC[Taiwan market data sources]
+      MIS[TWSE MIS<br/>real-time quotes]
+      EOD[TWSE MI_INDEX + TPEx<br/>end-of-day OHLCV]
+    end
 
-## LINE 推播
+    subgraph ENG["stock_market — screening engine (THIS REPO)"]
+      LOOP[run_intraday.py<br/>per-minute tick]
+      RANK[IntradayRanker<br/>2-stage breakout screen]
+      OUT[Console · Excel · LINE]
+      APIE[Embedded FastAPI<br/>:8000 /api/screen]
+      LOOP --> RANK --> OUT
+      RANK --> APIE
+    end
 
-改用 **LINE 官方帳號的 Messaging API push**。加 `--notify line`，**預設每天 13:00 把符合的個股彙整成一則推出**。
-設定（擇一；token 等同密碼，勿 commit）：`.env`（複製 `.env.example`）填 `LINE_CHANNEL_TOKEN` / `LINE_USER_ID`，或設同名環境變數。
-模式：`--notify-mode daily`（預設）+ `--notify-time 13:00`；或 `--notify-mode realtime`（每次更新就推、同檔當天去重）。`--notify-top N` 只推前 N 名。
+    subgraph BE[stock_quant_backend<br/>FastAPI + PostgreSQL :8100]
+      UAPI["/userapi · /downloadapi"]
+    end
 
-## 用法
+    subgraph FE[stock_quant_frontend<br/>React SPA + nginx]
+      UI[Browser UI]
+    end
+
+    MIS --> LOOP
+    EOD --> LOOP
+    RANK -->|"daily snapshots (ingest)"| UAPI
+    UI -->|polls /api/screen| APIE
+    UI -->|accounts / records| UAPI
+
+    style ENG fill:#eef6ff,stroke:#2563eb
+```
+
+## How the screen works
+
+For every stock with a known *previous close* and a *current price*, the engine computes
+`change% = (price − prev_close) / prev_close × 100`, then applies two stages:
+
+**Stage 1 — gainer pool**
+1. `change% ≥ 3%` (configurable via `--min-change`)
+2. price `≤` one tick below the limit-up price (locked limit-up names excluded; opt back
+   in with `--include-limit-up`). Limit-up is computed from Taiwan tick-size rules.
+
+**Stage 2 — six "breakout" conditions** (the default view)
+A stock qualifies as *starting to break out* when it shows a **red (up) candle**, **breaks
+the previous day's high**, **volume ratio ≥ 1.2×**, **trades above the 5-day MA**, the
+**20-day MA is sloping up**, and the **previous day closed below the 5-day MA**. Some
+parameters (volume ratio, MA windows, slope look-back, full-day volume projection) are
+tunable; the rest are fixed structural conditions.
+
+Only ordinary common stocks are scanned — ETFs, warrants, preferred shares and futures are
+filtered out by ticker convention.
+
+## Tech stack
+
+| Area | Choice |
+|---|---|
+| Language | Python 3.10+ |
+| Packaging | Poetry (`pyproject.toml` + `poetry.lock`) |
+| Concurrency | `multiprocessing` for batched whole-market fetches |
+| HTTP API | FastAPI + Uvicorn (optional `api` dependency group) |
+| Output | `openpyxl` (Excel), LINE Messaging API (push) |
+| Runtime | Docker + docker compose (TZ = `Asia/Taipei`) |
+| Tests | standard-library runner (`tests/run_tests.py`); `pytest`-compatible |
+
+## Getting started
+
+### Prerequisites
+- Python **3.10+**
+- [Poetry](https://python-poetry.org/) (`pipx install poetry`) — or just use Docker
+
+### Option A — Run locally with Poetry
 
 ```bash
-cd stock_market
+git clone <this-repo> && cd stock_market
+poetry install                 # core deps (openpyxl)
+poetry install --with api      # add this if you want the embedded HTTP API (--serve)
 
-python run_intraday.py                            # 盤中每分鐘篩 3%~漲停前一檔 + 寫 ranking.xlsx
-python run_intraday.py --once                     # 立刻跑一次 (盤中=即時 / 非盤中=最後交易日)
-python run_intraday.py --min-change 5             # 改成漲幅 ≥ 5%
-python run_intraday.py --include-limit-up         # 連已鎖漲停的也納入
-python run_intraday.py --no-filter                # 不篩選，輸出全市場漲幅排行
-python run_intraday.py --top 50                   # 畫面/LINE 只看前 50 名 (Excel 仍存全部)
-python run_intraday.py --excel out/today.xlsx     # 自訂 Excel 路徑
-python run_intraday.py --notify line              # 每日 13:00 彙整推播
-python run_intraday.py 2330 2317                  # 只看指定個股
+# Optional: enable LINE push / snapshot ingest
+cp .env.example .env           # then fill in the values you need (see below)
+
+# Run it
+poetry run python run_intraday.py            # per-minute screen + writes ranking.xlsx
+poetry run python run_intraday.py --once     # run a single pass and exit
 ```
 
-畫面輸出範例：
+> No virtualenv? `pip install openpyxl` and run `python run_intraday.py` directly — the
+> CLI itself only needs `openpyxl`. FastAPI/Uvicorn are only required for `--serve`.
+
+### Option B — Run with Docker (recommended for the long-running service)
+
+```bash
+cp .env.example .env           # edit if you want LINE / ingest; otherwise defaults are fine
+docker compose up -d --build
+```
+
+This starts the per-minute screener **and** the embedded API on port `8000`, persists the
+history cache in a named volume, and writes `ranking.xlsx` to `./data`. Verify:
+
+```bash
+curl http://localhost:8000/health           # {"status":"ok"}
+curl http://localhost:8000/api/screen       # latest screening snapshot (JSON)
+# Swagger UI: http://localhost:8000/docs
+```
+
+## CLI usage
+
+```bash
+python run_intraday.py                       # default: screen 3%~limit-up, write ranking.xlsx
+python run_intraday.py --once                # one pass now (live during hours, else last EOD)
+python run_intraday.py --min-change 5        # raise the gainer threshold to 5%
+python run_intraday.py --no-filter           # whole-market gainer ranking (no screen)
+python run_intraday.py --top 50              # console/LINE show top 50 (Excel still full)
+python run_intraday.py --excel out/today.xlsx
+python run_intraday.py --serve --api-port 8000   # also expose the HTTP API
+python run_intraday.py --notify line             # daily 13:00 LINE digest (needs .env)
+python run_intraday.py 2330 2317                 # watch specific tickers only
+```
+
+Sample console output:
 
 ```
-===== 漲幅篩選 (3%~漲停前一檔) 2026-06-12 11:30:00 [盤中即時] — 符合 2 檔 / 可算漲幅 1900 檔 / 全市場 1955 檔 =====
-   #  代號      名稱          市場            現價       漲跌      漲幅%        量(張)
+===== Breakout screen (3%~limit-up) 2026-06-12 11:30:00 [LIVE] — 2 matched / 1900 quotable / 1955 universe =====
+   #  Symbol  Name           Market     Price    Chg     Chg%      Vol(lots)
 --------------------------------------------------------------------------
-   1  2330    台積電         上市        109.50     9.50     9.50          25
-   2  2317    鴻海          上市        103.00     3.00     3.00           9
+   1  2330    TSMC           TWSE      109.50    9.50    9.50            25
+   2  2317    Hon Hai        TWSE      103.00    3.00    3.00             9
 ```
 
-## 運作方式 (盤中即時 + 每分鐘 + 多進程)
+## Embedded HTTP API
 
-1. **啟動取得歷史日K**：全市場逐日整批（上市 MI_INDEX、上櫃 OTC清單+逐檔），對 TWSE 限流友善
-   （單請求、退避、**逐日增量快取 `.cache/history.pkl`**，由最新往回補缺，最後交易日永遠會補上）。同時建立股票名稱對照。
-2. **交易時間每分鐘**：MIS 即時 API **批次 + 多進程**抓現價，當「今日K」與昨收算漲幅、篩選、排序。
-3. **非交易時間**：用最後一個交易日的完成日K 與前一日算漲幅（不抓即時）。
-4. 每次 print 符合個股 + 覆蓋寫 `ranking.xlsx`；視設定推 LINE。
+Enable with `--serve` (or via Docker). Interactive docs live at `/docs`.
 
-## 專案結構
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness/readiness probe |
+| GET | `/api/meta` | Snapshot metadata (source, freshness, counts, warnings) |
+| GET | `/api/screen` | Latest breakout results (accepts user filter params) |
+| GET | `/api/screen-defaults` | Server-side default screen parameters |
+| GET | `/api/pool` | Stage-1 gainer pool |
+| GET | `/api/history/{symbol}` | ~6 months of daily candles (+ intraday today) |
+| GET | `/api/quote/{symbol}` | Latest quote for one symbol |
+
+The loop computes once per minute and **publishes a single immutable snapshot**; the API
+only reads that snapshot, so HTTP traffic never triggers extra crawling. User-supplied
+filter parameters are re-applied to the cached raw rows on the fly.
+
+## Data sources & resilience
+
+- **Live quotes:** TWSE MIS endpoint, fetched in parallel batches with per-batch error
+  isolation (a throttled/timed-out batch is reported as a coverage warning, not a crash).
+- **End-of-day:** TWSE `MI_INDEX` (listed) + TPEx OpenAPI (OTC), normalized into a single
+  `DailyQuote` model.
+- **History cache:** incremental, on-disk (`.cache/history.pkl`), back-filled newest-first
+  so the latest trading day is always topped up even after a rate-limit interruption.
+- **After-close merge** pulls each market's completed daily K **independently** and only
+  marks the day done once *every* market is merged — so a late/rate-limited market never
+  leaves the board stuck on the previous trading day.
+
+## Project structure
 
 ```
 stock_market/
-├── run_intraday.py           # 唯一進入點: 盤中即時 + 盤後 EOD 自動切換 + 篩選 + Excel + LINE
-├── .env.example              # LINE 推播設定範本 (複製成 .env 填值)
+├── run_intraday.py            # single entry point: live/EOD switch, screen, Excel, LINE, --serve, --ingest
 ├── stock_quant/
-│   ├── domain/               # DailyQuote / Market + is_individual_stock
-│   ├── datasource/           # 個股清單(EOD) + 歷史日K(增量快取) + MIS即時 (單批錯誤隔離)
-│   ├── limits.py             # 台股升降單位 + 漲停價/漲停前一檔 (篩選用)
-│   ├── universe.py           # 全市場個股清單 + {代號:名稱} 對照
-│   ├── intraday.py           # 漲幅排行/篩選引擎 IntradayRanker (盤中即時/盤後EOD 自動切換)
-│   ├── excel_export.py       # 把結果寫進 .xlsx (openpyxl)
-│   ├── notify.py             # LINE 推播 + 每日彙整 / 即時彙整 + .env 載入
-│   └── scheduler.py          # 盤中時段�
+│   ├── domain/                # DailyQuote / Market value objects (no framework imports)
+│   ├── datasource/            # universe list, history (cached), MIS live, TWSE/TPEx EOD, market clock dates
+│   ├── limits.py              # Taiwan tick sizes + limit-up / one-tick-below-limit
+│   ├── intraday.py            # IntradayRanker: ranking + 2-stage screen, live⇄EOD auto-switch
+│   ├── breakout_screen.py     # the 6 breakout conditions (stage 2)
+│   ├── screen_service.py      # thread-safe snapshot holder for the API
+│   ├── api.py                 # embedded FastAPI app (--serve)
+│   ├── excel_export.py        # openpyxl writer
+│   ├── notify.py              # LINE push (daily digest / realtime, dedup) + .env loader
+│   ├── ingest.py              # POST daily snapshots to the user-data backend
+│   └── scheduler.py           # MarketClock (Taipei) + per-minute loop
+└── tests/                     # run_tests.py (zero-dep) + test_*.py
+```
+
+## Configuration (`.env`, optional)
+
+Only needed for LINE push and/or snapshot ingest; copy `.env.example` to `.env`.
+
+| Variable | Purpose |
+|---|---|
+| `LINE_CHANNEL_TOKEN` / `LINE_USER_ID` | LINE Messaging API push (comma-separate multiple users) |
+| `INGEST_URL` / `INGEST_TOKEN` | POST daily screening snapshots to `stock_quant_backend` (token must match the backend) |
+| `ALLOWED_ORIGINS` | CORS origins for the embedded API (default `*`) |
+
+## Testing
+
+```bash
+python tests/run_tests.py      # zero-dependency runner, auto-discovers tests/test_*.py
+# pytest also works if you prefer: pytest -q
+```
+
+The suite covers the ranking math, the 2-stage screen, limit-up rules, the live/EOD
+switch, and the after-close per-market merge logic — all with mocked data sources, so it
+runs offline in milliseconds.
+
+## Design decisions worth calling out
+
+- **Dependency inversion at the data layer** keeps `domain/` and the screening engine free
+  of vendor/HTTP code, so the rules are testable without a network.
+- **Compute-once, serve-many:** the per-minute snapshot is the single source of truth for
+  every output channel — the API is a pure reader.
+- **Be polite to public APIs:** batching, back-off, incremental caching and per-batch
+  isolation are deliberate choices to stay under TWSE rate limits rather than fight them.
+
+---
+
+*Disclaimer: this project is for technical and educational purposes. Screening results are
+probabilistic, lagging, and **not investment advice**.*
