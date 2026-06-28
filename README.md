@@ -135,4 +135,124 @@ poetry run python run_intraday.py --once     # run a single pass and exit
 ### Option B — Run with Docker (recommended for the long-running service)
 
 ```bash
-cp .env.example .env           # edit if you want LINE / ingest; otherwis
+cp .env.example .env           # edit if you want LINE / ingest; otherwise defaults are fine
+docker compose up -d --build
+```
+
+This starts the per-minute screener **and** the embedded API on port `8000`, persists the
+history cache in a named volume, and writes `ranking.xlsx` to `./data`. Verify:
+
+```bash
+curl http://localhost:8000/health           # {"status":"ok"}
+curl http://localhost:8000/api/screen       # latest screening snapshot (JSON)
+# Swagger UI: http://localhost:8000/docs
+```
+
+## CLI usage
+
+```bash
+python run_intraday.py                       # default: screen 3%~limit-up, write ranking.xlsx
+python run_intraday.py --once                # one pass now (live during hours, else last EOD)
+python run_intraday.py --min-change 5        # raise the gainer threshold to 5%
+python run_intraday.py --no-filter           # whole-market gainer ranking (no screen)
+python run_intraday.py --top 50              # console/LINE show top 50 (Excel still full)
+python run_intraday.py --excel out/today.xlsx
+python run_intraday.py --serve --api-port 8000   # also expose the HTTP API
+python run_intraday.py --notify line             # daily 13:00 LINE digest (needs .env)
+python run_intraday.py 2330 2317                 # watch specific tickers only
+```
+
+Sample console output:
+
+```
+===== Breakout screen (3%~limit-up) 2026-06-12 11:30:00 [LIVE] — 2 matched / 1900 quotable / 1955 universe =====
+   #  Symbol  Name           Market     Price    Chg     Chg%      Vol(lots)
+--------------------------------------------------------------------------
+   1  2330    TSMC           TWSE      109.50    9.50    9.50            25
+   2  2317    Hon Hai        TWSE      103.00    3.00    3.00             9
+```
+
+## Embedded HTTP API
+
+Enable with `--serve` (or via Docker). Interactive docs live at `/docs`.
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness/readiness probe |
+| GET | `/api/meta` | Snapshot metadata (source, freshness, counts, warnings) |
+| GET | `/api/screen` | Latest breakout results (accepts user filter params) |
+| GET | `/api/screen-defaults` | Server-side default screen parameters |
+| GET | `/api/pool` | Stage-1 gainer pool |
+| GET | `/api/history/{symbol}` | ~6 months of daily candles (+ intraday today) |
+| GET | `/api/quote/{symbol}` | Latest quote for one symbol |
+
+The loop computes once per minute and **publishes a single immutable snapshot**; the API
+only reads that snapshot, so HTTP traffic never triggers extra crawling. User-supplied
+filter parameters are re-applied to the cached raw rows on the fly.
+
+## Data sources & resilience
+
+- **Live quotes:** TWSE MIS endpoint, fetched in parallel batches with per-batch error
+  isolation (a throttled/timed-out batch is reported as a coverage warning, not a crash).
+- **End-of-day:** TWSE `MI_INDEX` (listed) + TPEx OpenAPI (OTC), normalized into a single
+  `DailyQuote` model.
+- **History cache:** incremental, on-disk (`.cache/history.pkl`), back-filled newest-first
+  so the latest trading day is always topped up even after a rate-limit interruption.
+- **After-close merge** pulls each market's completed daily K **independently** and only
+  marks the day done once *every* market is merged — so a late/rate-limited market never
+  leaves the board stuck on the previous trading day.
+
+## Project structure
+
+```
+stock_market/
+├── run_intraday.py            # single entry point: live/EOD switch, screen, Excel, LINE, --serve, --ingest
+├── stock_quant/
+│   ├── domain/                # DailyQuote / Market value objects (no framework imports)
+│   ├── datasource/            # universe list, history (cached), MIS live, TWSE/TPEx EOD, market clock dates
+│   ├── limits.py              # Taiwan tick sizes + limit-up / one-tick-below-limit
+│   ├── intraday.py            # IntradayRanker: ranking + 2-stage screen, live⇄EOD auto-switch
+│   ├── breakout_screen.py     # the 6 breakout conditions (stage 2)
+│   ├── screen_service.py      # thread-safe snapshot holder for the API
+│   ├── api.py                 # embedded FastAPI app (--serve)
+│   ├── excel_export.py        # openpyxl writer
+│   ├── notify.py              # LINE push (daily digest / realtime, dedup) + .env loader
+│   ├── ingest.py              # POST daily snapshots to the user-data backend
+│   └── scheduler.py           # MarketClock (Taipei) + per-minute loop
+└── tests/                     # run_tests.py (zero-dep) + test_*.py
+```
+
+## Configuration (`.env`, optional)
+
+Only needed for LINE push and/or snapshot ingest; copy `.env.example` to `.env`.
+
+| Variable | Purpose |
+|---|---|
+| `LINE_CHANNEL_TOKEN` / `LINE_USER_ID` | LINE Messaging API push (comma-separate multiple users) |
+| `INGEST_URL` / `INGEST_TOKEN` | POST daily screening snapshots to `stock_quant_backend` (token must match the backend) |
+| `ALLOWED_ORIGINS` | CORS origins for the embedded API (default `*`) |
+
+## Testing
+
+```bash
+python tests/run_tests.py      # zero-dependency runner, auto-discovers tests/test_*.py
+# pytest also works if you prefer: pytest -q
+```
+
+The suite covers the ranking math, the 2-stage screen, limit-up rules, the live/EOD
+switch, and the after-close per-market merge logic — all with mocked data sources, so it
+runs offline in milliseconds.
+
+## Design decisions worth calling out
+
+- **Dependency inversion at the data layer** keeps `domain/` and the screening engine free
+  of vendor/HTTP code, so the rules are testable without a network.
+- **Compute-once, serve-many:** the per-minute snapshot is the single source of truth for
+  every output channel — the API is a pure reader.
+- **Be polite to public APIs:** batching, back-off, incremental caching and per-batch
+  isolation are deliberate choices to stay under TWSE rate limits rather than fight them.
+
+---
+
+*Disclaimer: this project is for technical and educational purposes. Screening results are
+probabilistic, lagging, and **not investment advice**.*
