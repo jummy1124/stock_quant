@@ -293,6 +293,45 @@ def test_ranker_eod_partial_market_publish_retries(monkeypatch):
     assert calls[1] == ("twse",)                                   # 只重抓仍缺的市場
 
 
+def test_ranker_eod_partial_symbols_within_market_retries(monkeypatch):
+    """同一市場只先公布『部分個股』時，落後的個股不可被永久卡在前一交易日。
+
+    回歸先前 bug：『該市場有任一檔到今日就把整個市場標記完成』→ 後續陸續公布的個股
+    再也不會被補抓。改用覆蓋率門檻後，部分公布時市場仍視為未完成，下個 cycle 會把
+    落後的個股一併補上，且未併齊期間會寫進 last_warning。
+    """
+    monkeypatch.setattr(intraday_mod, "fetch_realtime",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("不該抓即時價")))
+    yday, today = date(2026, 6, 22), date(2026, 6, 23)
+    rk = IntradayRanker([("1101", Market.TWSE), ("1102", Market.TWSE),
+                         ("1103", Market.TWSE)], processes=1, apply_filter=False)
+    for s in ("1101", "1102", "1103"):
+        rk._history[s] = [_bar(s, yday, 100, 1000)]                # 三檔都只有昨日
+
+    calls = []
+    def fake_eod(markets, day, **k):
+        calls.append(tuple(markets))
+        if len(calls) == 1:                                        # 第一次只公布 1101
+            return {"1101": _bar("1101", today, 110, 1500)}
+        return {s: _bar(s, today, 110, 1500) for s in ("1101", "1102", "1103")}
+    monkeypatch.setattr(intraday_mod, "fetch_market_eod", fake_eod)
+
+    # 第一次 tick：只有 1101 到今日 (覆蓋 1/3 < 門檻) -> 市場未完成、1102/1103 仍昨日
+    rk.tick(datetime(2026, 6, 23, 15, 0))
+    assert rk._history["1101"][-1].trade_date == today
+    assert rk._history["1102"][-1].trade_date == yday
+    assert rk._history["1103"][-1].trade_date == yday
+    assert rk._eod_day is None                                     # 未併齊不可標記完成
+    assert rk.last_warning and "TWSE" in rk.last_warning           # 明確提示仍沿用昨日
+
+    # 第二次 tick：其餘個股補上 -> 落後的 1102/1103 被補齊、才標記完成
+    rk.tick(datetime(2026, 6, 23, 15, 1))
+    assert rk._history["1102"][-1].trade_date == today
+    assert rk._history["1103"][-1].trade_date == today
+    assert rk._eod_day == today
+    assert len(calls) == 2                                         # 第一次未完成 -> 有重試
+
+
 def test_ranker_tick_eod_can_be_disabled(monkeypatch):
     rk = IntradayRanker([("2330", Market.TWSE)], processes=1, eod_when_closed=False)
     rk._history["2330"] = [_bar("2330", date(2026, 6, 4), 100, 1000),

@@ -88,6 +88,10 @@ class IntradayRanker:
     name_map: {代號: 名稱}，用來補上輸出的股票名稱 (來源資料缺名稱時)。
     """
 
+    # 盤後判定「某市場今日完成日K已公布完成」的覆蓋率門檻：該市場有歷史的個股中，
+    # 已併入今日K的比例達此值才算完成 (容忍少數暫停交易/未成交個股)。
+    _EOD_MARKET_DONE_RATIO = 0.9
+
     def __init__(self, pairs: Sequence[tuple[str, Optional[Market]]], months: int = 5,
                  batch_size: int = 40, processes: Optional[int] = None,
                  clock: Optional[MarketClock] = None,
@@ -221,20 +225,33 @@ class IntradayRanker:
         return out
 
     def _markets_with_today(self, day: date) -> set[str]:
-        """回傳『今日完成日K已併入歷史』的市場集合 (該市場有任一檔 history[-1] 已達 day)。
+        """回傳『今日完成日K已大致併入歷史』的市場集合。
 
-        用來判斷盤後補抓還缺哪些市場：某市場今日尚未公布 / 被限流而沒併入時，不能因為
-        「另一個市場已併入」就整天不再重試，否則該市場會一直停在前一交易日。
+        以「該市場有歷史的個股中，history[-1] 已達 day 的比例」判斷，達門檻
+        (``_EOD_MARKET_DONE_RATIO``) 才算該市場今日已公布完成。
+
+        **不可用「該市場有任一檔到今日」判斷**：交易所盤後常先公布一部分個股、稍後
+        才補齊其餘個股；若一見到第一檔就把整個市場標記完成，後面陸續公布的個股會被
+        永遠卡在前一交易日（且該市場不再被重抓）。改用覆蓋率門檻後，部分公布時該市場
+        仍視為未完成，下個 cycle 會繼續補抓、把落後的個股一併補上；少數整天未成交/
+        暫停交易的個股不會把比例壓到門檻以下，故仍能正常收斂、不致無限重抓。
         """
-        done: set[str] = set()
+        total: dict[str, int] = {}
+        at_day: dict[str, int] = {}
         for symbol, market in self.pairs:
             if market is None:
                 continue
-            key = market.name.lower()
-            if key in done:
-                continue
             hist = self._history.get(symbol)
-            if hist and hist[-1].trade_date >= day:
+            if not hist:
+                continue
+            key = market.name.lower()
+            total[key] = total.get(key, 0) + 1
+            last = hist[-1].trade_date
+            if last is not None and last >= day:
+                at_day[key] = at_day.get(key, 0) + 1
+        done: set[str] = set()
+        for key, n in total.items():
+            if n > 0 and at_day.get(key, 0) / n >= self._EOD_MARKET_DONE_RATIO:
                 done.add(key)
         return done
 
@@ -245,18 +262,19 @@ class IntradayRanker:
         且只在啟動載一次，故收盤後 EOD 模式用的 history[-1] 其實是昨日。這裡在收盤後
         補抓今日完成日K (來源與歷史一致、且做日期核對) 併入，讓 history[-1] 變回今日。
 
-        **只對『今日尚未併入』的市場重抓** (上市 MI_INDEX 較易被限流、且常比上櫃晚公布)：
-        並且唯有「所有市場的今日完成日K都併入」後才標記本日完成 (self._eod_day)。否則保持
-        未標記，下個 cycle 會只針對仍缺今日的市場重試 —— 避免某一市場暫時抓不到時，整天
-        都停在前一交易日。今日資料尚未公布 / 假日 / 抓取失敗時 **不動歷史**，下次再試
-        (此時 EOD 仍 fallback 顯示最後一個已完成交易日)。回傳本次新併入的檔數。
+        **只對『今日尚未併齊』的市場重抓** (上市 MI_INDEX 較易被限流、且常比上櫃晚公布)：
+        市場以覆蓋率門檻判斷是否已完成 (見 _markets_with_today)，唯有所有市場都達門檻後
+        才標記本日完成 (self._eod_day)。否則保持未標記，下個 cycle 繼續補抓仍缺今日的市場
+        與個股 —— 避免某市場暫時抓不到、或只先公布一部分個股時，落後者整天停在前一交易日。
+        今日資料尚未公布 / 抓不齊 / 抓取失敗時，把待補狀況寫進 last_warning（讓 /api/meta
+        看得到，而非靜默沿用昨日資料），並 fallback 顯示最後一個已完成交易日。回傳本次新併入檔數。
         """
         if self._eod_day == day:
             return 0
         all_markets = ({m.name.lower() for _s, m in self.pairs if m is not None}
                        or {"twse", "tpex"})
         pending = all_markets - self._markets_with_today(day)
-        if not pending:                                 # 所有市場今日都已併入 -> 標記完成
+        if not pending:                                 # 所有市場今日都已併齊 -> 標記完成
             self._eod_day = day
             return 0
         try:
@@ -269,13 +287,20 @@ class IntradayRanker:
             hist = self._history.get(symbol)
             if not hist:
                 continue                                # 無歷史(昨收) 就無從算漲幅，略過
-            if hist[-1].trade_date >= day:
+            last = hist[-1].trade_date
+            if last is not None and last >= day:
                 continue                                # 今日已在歷史中 -> 不重複併入
+            if getattr(q, "trade_date", None) != day:
+                continue                                # 防呆: 只併入確為今日的完成日K
             hist.append(q)
             merged += 1
-        # 只有當所有市場的今日完成日K都併入後才標記本日完成；否則下個 cycle 會重試仍缺的市場。
-        if not (all_markets - self._markets_with_today(day)):
+        # 唯有所有市場今日都達覆蓋率門檻才標記完成；否則寫 warning 並讓下個 cycle 繼續補。
+        still_pending = all_markets - self._markets_with_today(day)
+        if not still_pending:
             self._eod_day = day
+        else:
+            _miss = ", ".join(sorted(m.upper() for m in still_pending))
+            self.last_warning = f"盤後今日完成日K尚未併齊，下列市場仍沿用最後交易日: {_miss}"
         return merged
 
     def _tick_eod(self, now: datetime) -> list[RankRow]:
