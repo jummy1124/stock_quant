@@ -11,7 +11,7 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       # 上傳每日篩選快照到同一台 VM 上的 userdata 後端 (它把 8100 publish 在 host)。
       # 容器內以 host.docker.internal 連回 host；INGEST_TOKEN 由 .env 提供 (需與後端一致)。
-      INGEST_URL: ${INGEST_URL:-http://host.docker.internal:8100}
+      INGEST_URL: ${INGEST_URL:-http://stock-quant-userdata:8100}
     env_file:
       - .env
     # 讓容器內能用 host.docker.internal 解析到 VM host (連後端的 8100)
@@ -27,6 +27,12 @@ services:
     # --ingest：每交易日 13:00 + 收盤後把篩選結果 POST 到 userdata 後端 (INGEST_URL/INGEST_TOKEN)
     command: ["--excel", "/app/data/ranking.xlsx", "--serve", "--api-port", "8000", "--notify", "line", "--notify-ip-on-start", "--ingest"]
     restart: unless-stopped
+    networks:
+      - stock-quant-shared
 
 volumes:
   stock-cache:
+
+networks:
+  stock-quant-shared:
+    external: true

@@ -69,6 +69,8 @@ health_check() {
 }
 
 bring_up() {
+  # 確保跨 stack 共用網路存在 (stock-quant <-> userdata 後端 ingest 連線用)；已存在則略過
+  ${SUDO} docker network create stock-quant-shared 2>/dev/null || true
   # 用 sudo env 帶入 IMAGE，避免 sudo 清掉前置環境變數導致 compose 取不到 ${IMAGE}
   ${SUDO} env IMAGE="$1" ${DC_BIN} -f "${COMPOSE_FILE}" up -d --remove-orphans
 }
