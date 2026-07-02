@@ -4,7 +4,8 @@
 
 兩種快照 (對應後端 SESSIONS)：
   - intraday_1300 : 交易日盤中、到指定時間 (預設 13:00) 的第一個 tick，把當下起漲個股推一份。
-  - eod           : 非交易時間 (收盤後/盤前) 用「最後交易日完成日K」算出的起漲個股，每個交易日推一次。
+  - eod           : 收盤後用「最後交易日完成日K」算出的起漲個股，每個交易日推一次
+                    (只在該交易日確實收盤後才送；不會在盤前/收盤前就冒出當日的盤後快照)。
 
 去重以 (session, 交易日) 為鍵：同一交易日同一 session 只推一次 (後端本身也是 idempotent
 upsert，重推只會覆蓋，故行程重啟造成的重推無害)。
@@ -155,9 +156,11 @@ class SnapshotIngestor:
     """
 
     def __init__(self, cfg: IngestConfig, fire_time: time = time(13, 0),
+                 close_time: time = time(13, 30),
                  log: Callable[[str], None] = print):
         self.cfg = cfg
         self.fire_time = fire_time
+        self.close_time = close_time   # 交易日收盤時間;盤後快照只在該交易日收盤後才送
         self.log = log
         self._sent: set[tuple[str, str]] = set()   # (session, trade_date.isoformat())
 
@@ -185,5 +188,9 @@ class SnapshotIngestor:
             self._send(now, now.date(), SESSION_INTRADAY_1300, source,
                        scored, pool_rows, ranker)
         else:  # eod
-            td = _eod_trade_date(ranker) or now.date()
+            td = _eod_trade_date(ranker)
+            if td is None:
+                return   # 歷史未就緒 -> 無可靠的最後交易日,不送 (別用今天日期造出假的盤後快照)
+            if td >= now.date() and now.time() < self.close_time:
+                return   # 該交易日=今天且尚未收盤 -> 盤後快照還不該出現 (前端才不會提早顯示下載)
             self._send(now, td, SESSION_EOD, source, scored, pool_rows, ranker)
