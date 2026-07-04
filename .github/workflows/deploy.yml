@@ -1,12 +1,8 @@
-name: Daily Deploy to GCP VM
+name: Manual Deploy to GCP VM
 
-# 每日固定時段檢查 main 是否有「尚未部署」的新版本，有才部署到 GCP VM。
-#   排程: 00:40 UTC = 08:40 Asia/Taipei (台股 09:00 開盤前)
-#   GitHub 排程為 best-effort，尖峰時可能延後數分鐘，可接受。
-#   也可手動觸發 (workflow_dispatch)，force=true 可略過「無更新」檢查強制重部署。
+# 手動觸發部署：檢查 main 是否有「尚未部署」的新版本，有才部署到 GCP VM。
+#   僅支援手動觸發 (workflow_dispatch)，force=true 可略過「無更新」檢查強制重部署。
 on:
-  schedule:
-    - cron: "40 0 * * *"
   workflow_dispatch:
     inputs:
       force:
