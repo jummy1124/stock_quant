@@ -37,7 +37,6 @@ def test_fetch_twse_day_holiday_returns_empty(monkeypatch):
 
 
 def test_fetch_twse_day_uses_rwd_endpoint(monkeypatch):
-    # 應優先打新的 /rwd/zh/afterTrading/ 端點 (舊 /exchangeReport/ 已常被擋)
     seen = {}
     payload = {"stat": "OK", "tables": [
         {"fields": ["證券代號", "收盤價"], "data": [["2330", "1005.00"]]}]}
@@ -52,7 +51,6 @@ def test_fetch_twse_day_uses_rwd_endpoint(monkeypatch):
 
 
 def test_fetch_twse_day_falls_back_on_error(monkeypatch):
-    # 新端點連線失敗 -> 自動改用舊端點備援
     payload = {"stat": "OK", "tables": [
         {"fields": ["證券代號", "收盤價"], "data": [["2330", "1005.00"]]}]}
     calls = []
@@ -88,7 +86,7 @@ def test_tpex_history_parses(monkeypatch):
     monkeypatch.setattr(hist_mod, "get_json", lambda *a, **k: payload)
     quotes = TpexHistoryDataSource(polite_delay=0).fetch_history("6488", months=1)
     assert len(quotes) >= 2
-    assert quotes[0].trade_date == date(2026, 6, 3)        # 升冪、民國轉西元
+    assert quotes[0].trade_date == date(2026, 6, 3)
     assert float(quotes[0].close) == 505.0
     assert quotes[0].market == Market.TPEX
 
@@ -111,7 +109,6 @@ def test_load_market_history_tpex_path(monkeypatch):
     def fake_get_history(symbol, market=None, months=5):
         return [mh.DailyQuote.normalize(symbol=symbol, name="", market=Market.TPEX,
                                         trade_date=date(2026, 6, 3), open=500, high=510, low=498, close=505)]
-    # _otc_worker 內部 from .history import get_history -> patch 該模組屬性
     monkeypatch.setattr(hist_mod, "get_history", fake_get_history)
     hist = mh.load_market_history(("tpex",), days=5, delay=0, processes=1, today=date(2026, 6, 8))
     assert "6488" in hist and hist["6488"][0].market == Market.TPEX
@@ -131,7 +128,7 @@ def test_load_market_history_cache(monkeypatch):
         mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 8))
         n1 = seen["n"]
         mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 8))
-        assert seen["n"] == n1        # 第二次 (同一天) 走快取、不重抓
+        assert seen["n"] == n1
 
 
 # ---- 回歸: 快取已滿但缺最新一天時，仍要補抓最新交易日 -------------------
@@ -145,13 +142,11 @@ def test_load_market_history_fetches_newest_missing_day(monkeypatch):
     monkeypatch.setattr(mh, "fetch_twse_day", fake_twse)
     with tempfile.TemporaryDirectory() as d:
         cache = os.path.join(d, "h.pkl")
-        # 先用較早的 today 建快取 (Jun 5 -> 抓 Jun4,Jun3,Jun2)
         mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 5))
         fetched.clear()
-        # 隔幾天再跑 (Jun 9): 視窗 Jun8,Jun5,Jun4 -> Jun8/Jun5 未抓過 -> 補抓最新
         hist = mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache, today=date(2026, 6, 9))
-        assert date(2026, 6, 8) in fetched                            # 有補到最新一天
-        assert max(q.trade_date for q in hist["2330"]) == date(2026, 6, 8)   # 最後交易日已更新
+        assert date(2026, 6, 8) in fetched
+        assert max(q.trade_date for q in hist["2330"]) == date(2026, 6, 8)
 
 
 # ---- 回歸: 上櫃快取落後最新交易日時要重抓 ------------------------------
@@ -174,12 +169,12 @@ def test_load_market_history_tpex_refetches_when_stale(monkeypatch):
         cache = os.path.join(dd, "h.pkl")
         old = [mh.DailyQuote.normalize(symbol="6488", name="", market=Market.TPEX,
                                        trade_date=date(2026, 6, 3), open=1, high=1, low=1, close=1)]
-        with open(cache, "wb") as f:           # 預先放一份「落後到 6/3」的上櫃快取
+        with open(cache, "wb") as f:
             pickle.dump({"ver": mh._CACHE_VERSION, "twse_days": {}, "twse_done": [],
                          "tpex": {"6488": old}}, f)
         hist = mh.load_market_history(("twse", "tpex"), days=3, delay=0, processes=1,
                                       cache_path=cache, today=date(2026, 6, 9))
-        assert calls["n"] >= 1                                        # 落後 -> 有重抓上櫃
+        assert calls["n"] >= 1
         assert max(q.trade_date for q in hist["6488"]) == date(2026, 6, 8)
 
 
@@ -194,7 +189,41 @@ def test_twse_history_parses(monkeypatch):
     quotes = TwseHistoryDataSource(polite_delay=0).fetch_history("2330", months=1)
     assert len(quotes) >= 2 and quotes[0].trade_date == date(2026, 6, 3)
     assert quotes[0].market == Market.TWSE
-    assert quotes[0].volume == 30000000          # 股 (×1)
+    assert quotes[0].volume == 30000000
+
+
+# ---- 快取修剪 (只保留最近 N 個交易日) -----------------------------------
+def test_prune_history_keeps_only_recent_n():
+    twse_days = {f"2026-01-{d:02d}": [f"row{d}"] for d in range(1, 11)}
+    twse_done = set(twse_days) | {"2025-12-31"}
+    tpex_cache = {"6488": [
+        mh.DailyQuote.normalize(symbol="6488", name="", market=Market.TPEX,
+                                 trade_date=date(2026, 1, d), open=1, high=1, low=1, close=1)
+        for d in range(1, 11)
+    ]}
+    mh._prune_history(twse_days, twse_done, tpex_cache, keep=3)
+    assert sorted(twse_days) == ["2026-01-08", "2026-01-09", "2026-01-10"]
+    assert twse_done == {"2026-01-08", "2026-01-09", "2026-01-10"}
+    assert [q.trade_date.day for q in tpex_cache["6488"]] == [8, 9, 10]
+
+
+def test_load_market_history_prunes_old_cache_to_keep_limit(monkeypatch):
+    def fake_twse(d, timeout=10.0):
+        return [mh.DailyQuote.normalize(symbol="2330", name="", market=Market.TWSE,
+                                        trade_date=d, open=1, high=1, low=1, close=1)]
+    monkeypatch.setattr(mh, "fetch_twse_day", fake_twse)
+    with tempfile.TemporaryDirectory() as d:
+        cache = os.path.join(d, "h.pkl")
+        old_days = {f"2026-01-{d:02d}": [] for d in range(1, 11)}
+        with open(cache, "wb") as f:
+            pickle.dump({"ver": mh._CACHE_VERSION, "twse_days": old_days,
+                         "twse_done": sorted(old_days), "tpex": {}}, f)
+        mh.load_market_history(("twse",), days=3, delay=0, cache_path=cache,
+                                today=date(2026, 1, 12), keep_trading_days=3)
+        with open(cache, "rb") as f:
+            saved = pickle.load(f)
+        assert len(saved["twse_days"]) <= 3
+        assert min(saved["twse_days"]) >= "2026-01-08"
 
 
 # ---- universe 組裝 -----------------------------------------------------

@@ -24,6 +24,7 @@ from ..domain import DailyQuote, Market, is_individual_stock
 from .http import get_json
 
 _CACHE_VERSION = 4   # v4: 改為逐日增量快取 (twse_days / twse_done / tpex)
+_KEEP_TRADING_DAYS = 60   # 快取只保留最近 N 個交易日，更舊的直接砍掉 (避免 pkl 無限增長)
 
 _MI_INDEX_URLS = (
     "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={ymd}&type=ALLBUT0999&response=json",
@@ -151,6 +152,32 @@ def _otc_worker(payload):
         return symbol, []
 
 
+def _prune_history(
+    twse_days: dict[str, list],
+    twse_done: set[str],
+    tpex_cache: dict[str, list],
+    keep: int,
+) -> None:
+    """只保留最近 keep 個交易日的資料，其餘直接刪除 (原地修改，避免快取無限累積)。
+
+    - twse_days / twse_done: 依日期字串排序 (ISO 格式可直接字典序比較)，只留最新 keep 個
+      「有資料的交易日」，其餘 (含更舊的假日空白標記) 一併砍掉。
+    - tpex_cache: 逐檔依 trade_date 排序，只留最近 keep 筆。
+    """
+    if keep <= 0:
+        return
+    if len(twse_days) > keep:
+        cutoff_iso = sorted(twse_days)[-keep]   # 第 keep 新的交易日 (含) 以後才留
+        for iso in [d for d in twse_days if d < cutoff_iso]:
+            del twse_days[iso]
+        for iso in [d for d in twse_done if d < cutoff_iso]:
+            twse_done.discard(iso)
+    for sym, quotes in tpex_cache.items():
+        if len(quotes) > keep:
+            quotes.sort(key=lambda q: q.trade_date)
+            tpex_cache[sym] = quotes[-keep:]
+
+
 def _read_cache(cache_path: Optional[str]) -> dict:
     """讀取增量快取 (版本不符或讀不到 -> 視為空，重新累積)。"""
     if not cache_path or not Path(cache_path).exists():
@@ -176,6 +203,7 @@ def load_market_history(
     progress: Optional[Callable[[str], None]] = None,
     processes: Optional[int] = None,
     today: Optional[date] = None,
+    keep_trading_days: int = _KEEP_TRADING_DAYS,
 ) -> dict[str, list[DailyQuote]]:
     import time as _time
 
@@ -187,10 +215,13 @@ def load_market_history(
     twse_days: dict[str, list[DailyQuote]] = dict(cache.get("twse_days", {}))   # iso -> 當日全市場
     twse_done: set[str] = set(cache.get("twse_done", []))                       # 已成功抓過(含假日空)
     tpex_cache: dict[str, list[DailyQuote]] = dict(cache.get("tpex", {}))
+    # 舊快取可能還留著超過 keep_trading_days 的資料 (升級前累積的)，載入後先修剪一次
+    _prune_history(twse_days, twse_done, tpex_cache, keep_trading_days)
 
     def _save():
         if not cache_path:
             return
+        _prune_history(twse_days, twse_done, tpex_cache, keep_trading_days)
         try:
             Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, "wb") as f:
