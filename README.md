@@ -160,6 +160,8 @@ python run_intraday.py --excel out/today.xlsx
 python run_intraday.py --serve --api-port 8000   # also expose the HTTP API
 python run_intraday.py --notify line             # daily 13:00 LINE digest (needs .env)
 python run_intraday.py 2330 2317                 # watch specific tickers only
+python run_intraday.py --ingest                  # upload daily snapshots + closes (needs .env)
+python run_backfill_prices.py                    # backfill whole-market closes for the backtest
 ```
 
 Sample console output:
@@ -190,6 +192,31 @@ The loop computes once per minute and **publishes a single immutable snapshot**;
 only reads that snapshot, so HTTP traffic never triggers extra crawling. User-supplied
 filter parameters are re-applied to the cached raw rows on the fly.
 
+## Feeding the backtest
+
+`--ingest` uploads two things after close, over the same `INGEST_URL` / `INGEST_TOKEN`:
+
+- the day's **screening snapshot** (which stocks passed) — `stock_quant/ingest.py`
+- the day's **whole-market closes** — `stock_quant/price_ingest.py`
+
+The second one exists because the backtest asks what a screened stock was worth N trading
+days *later*, and on those later days it usually isn't in any snapshot. The prices come
+straight out of the ranker's in-memory history, so uploading them costs no extra requests
+to the exchange. Each run re-sends the last few trading days (`--ingest-price-days`,
+default 5) — the backend upserts, so a night the machine was down heals itself. Disable
+with `--no-ingest-prices` if you only want snapshots.
+
+For history that predates the feature, run the backfill once:
+
+```bash
+python run_backfill_prices.py --days 60      # uses the same .cache, so already-fetched days cost nothing
+python run_backfill_prices.py --dry-run      # show what would be sent
+```
+
+It shares `load_market_history` with the screener, so it is bounded by the same cache
+horizon (~60 trading days); earlier days are not retrievable from the upstream sources
+this project uses.
+
 ## Data sources & resilience
 
 - **Live quotes:** TWSE MIS endpoint, fetched in parallel batches with per-batch error
@@ -207,6 +234,7 @@ filter parameters are re-applied to the cached raw rows on the fly.
 ```
 stock_market/
 ├── run_intraday.py            # single entry point: live/EOD switch, screen, Excel, LINE, --serve, --ingest
+├── run_backfill_prices.py     # one-off: backfill whole-market closes so the backtest can reach older days
 ├── stock_quant/
 │   ├── domain/                # DailyQuote / Market value objects (no framework imports)
 │   ├── datasource/            # universe list, history (cached), MIS live, TWSE/TPEx EOD, market clock dates
@@ -218,6 +246,7 @@ stock_market/
 │   ├── excel_export.py        # openpyxl writer
 │   ├── notify.py              # LINE push (daily digest / realtime, dedup) + .env loader
 │   ├── ingest.py              # POST daily snapshots to the user-data backend
+│   ├── price_ingest.py        # POST whole-market daily closes (the backtest's price source)
 │   └── scheduler.py           # MarketClock (Taipei) + per-minute loop
 └── tests/                     # run_tests.py (zero-dep) + test_*.py
 ```
@@ -229,7 +258,7 @@ Only needed for LINE push and/or snapshot ingest; copy `.env.example` to `.env`.
 | Variable | Purpose |
 |---|---|
 | `LINE_CHANNEL_TOKEN` / `LINE_USER_ID` | LINE Messaging API push (comma-separate multiple users) |
-| `INGEST_URL` / `INGEST_TOKEN` | POST daily screening snapshots to `stock_quant_backend` (token must match the backend) |
+| `INGEST_URL` / `INGEST_TOKEN` | POST daily screening snapshots **and whole-market closes** to `stock_quant_backend` (token must match the backend) |
 | `ALLOWED_ORIGINS` | CORS origins for the embedded API (default `*`) |
 
 ## Testing

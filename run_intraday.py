@@ -46,6 +46,7 @@ from stock_quant.excel_export import save_ranking
 from stock_quant.ingest import IngestConfig, SnapshotIngestor
 from stock_quant.intraday import IntradayRanker
 from stock_quant.netinfo import push_startup_ip
+from stock_quant.price_ingest import DailyPriceIngestor
 from stock_quant.notify import DailyDigestAlerter, LineNotifier, StableAlerter, load_dotenv
 from stock_quant.scheduler import MarketClock, run_market_loop
 from stock_quant.universe import load_name_map
@@ -137,9 +138,15 @@ def _build_alerter(enabled: bool, mode: str, notify_time: time):
 
 
 def _build_ingestor(args):
-    """--ingest 時建立上傳器；缺 INGEST_URL / INGEST_TOKEN 則停用並提示。"""
+    """--ingest 時建立上傳器；缺 INGEST_URL / INGEST_TOKEN 則停用並提示。
+
+    回傳 (快照上傳器, 收盤價上傳器)，兩者共用同一組 INGEST_URL / INGEST_TOKEN。
+    收盤價那份是回測的價格來源 —— 篩選快照只記「當天被選上的」，回測要問的卻是那些
+    個股在之後第 N 個交易日值多少，所以後端另外需要一份全市場日K。資料本來就在
+    ranker 的記憶體歷史裡，上傳不會多打證交所一次請求。
+    """
     if not args.ingest:
-        return None
+        return None, None
     cfg = IngestConfig.from_env()
     if args.ingest_url:
         cfg.base_url = args.ingest_url
@@ -148,10 +155,16 @@ def _build_ingestor(args):
     if not cfg.configured:
         print("⚠️ 已指定 --ingest，但缺 INGEST_URL / INGEST_TOKEN "
               "(.env、環境變數或 --ingest-url/--ingest-token) -> 暫不上傳。")
-        return None
+        return None, None
     fire = _parse_hhmm(args.ingest_time)
     print(f"📤 篩選快照上傳已啟用: {cfg.base_url} (盤中快照 {fire:%H:%M}；收盤後每交易日一次)")
-    return SnapshotIngestor(cfg, fire_time=fire)
+    prices = None
+    if not args.no_ingest_prices:
+        prices = DailyPriceIngestor(cfg, days=args.ingest_price_days)
+        print(f"📈 全市場收盤價上傳已啟用 (收盤後補最近 {args.ingest_price_days} 個交易日，供回測用)")
+    else:
+        print("ℹ️ --no-ingest-prices: 不上傳全市場收盤價 -> 回測頁會缺少後續價格。")
+    return SnapshotIngestor(cfg, fire_time=fire), prices
 
 
 def _load_names(market_arg: str) -> dict:
@@ -263,6 +276,10 @@ def main(argv=None) -> int:
                         help="ingestion 服務 token (預設讀環境變數 INGEST_TOKEN)")
     parser.add_argument("--ingest-time", default="13:00",
                         help="盤中快照 (intraday_1300) 的上傳時間 HH:MM (預設 13:00)")
+    parser.add_argument("--no-ingest-prices", action="store_true",
+                        help="--ingest 時不順便上傳全市場每日收盤價 (回測頁需要這份資料)")
+    parser.add_argument("--ingest-price-days", type=int, default=5,
+                        help="收盤後回補最近 N 個交易日的全市場收盤價 (預設 5；後端 upsert，重送無害)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (盤中=即時 / 非盤中=最後交易日)")
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
@@ -271,7 +288,7 @@ def main(argv=None) -> int:
     market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
-    ingestor = _build_ingestor(args)
+    ingestor, price_ingestor = _build_ingestor(args)
     # 先把內嵌 API 起起來，讓 /health 立即就緒 (liveness)，不必等下面 (可能很慢的)
     # 名稱對照 + 全市場歷史 bootstrap；ranker 備妥後再 attach。避免部署冷啟動時
     # 健康檢查在 90s 內等不到 /health 而誤判失敗、觸發回滾。
@@ -386,6 +403,10 @@ def main(argv=None) -> int:
         # 上傳當日篩選快照 (盤中 13:00 / 收盤後)；同日同 session 去重，失敗不中斷。
         if ingestor is not None:
             ingestor.process(now, scored, rows, ranker)
+        # 收盤後順便把全市場收盤價送給後端 (回測的價格來源)。資料取自 ranker 已在
+        # 記憶體裡的歷史，不會多抓一次；同一交易日去重，失敗不中斷。
+        if price_ingestor is not None:
+            price_ingestor.process(now, ranker)
 
     if args.once:
         _cycle(datetime.now())
