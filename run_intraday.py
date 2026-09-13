@@ -40,6 +40,7 @@ import sys
 from datetime import datetime, time
 
 from stock_quant.breakout_screen import BreakoutConfig, save_breakout, screen_breakout
+from stock_quant.branch_ingest import BranchIngestor
 from stock_quant.datasource import load_market_history
 from stock_quant.domain import Market
 from stock_quant.excel_export import save_ranking
@@ -280,6 +281,7 @@ def main(argv=None) -> int:
                         help="--ingest 時不順便上傳全市場每日收盤價 (回測頁需要這份資料)")
     parser.add_argument("--ingest-price-days", type=int, default=5,
                         help="收盤後回補最近 N 個交易日的全市場收盤價 (預設 5；後端 upsert，重送無害)")
+    parser.add_argument("--branch-ingest-time", default="19:30", help="分點抓取時間 (預設 19:30)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--once", action="store_true", help="只跑一次就結束 (盤中=即時 / 非盤中=最後交易日)")
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
@@ -289,6 +291,14 @@ def main(argv=None) -> int:
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
     ingestor, price_ingestor = _build_ingestor(args)
+    branch_ingestor = None
+    if args.ingest:
+        cfg = IngestConfig.from_env()
+        if args.ingest_url: cfg.base_url = args.ingest_url
+        if args.ingest_token: cfg.token = args.ingest_token
+        if cfg.configured:
+            branch_ingestor = BranchIngestor(cfg.base_url, cfg.token, fire_time=_parse_hhmm(args.branch_ingest_time))
+            print(f"分點進出已啟用：每日 {args.branch_ingest_time} 抓取凱基-三多並推播 LINE")
     # 先把內嵌 API 起起來，讓 /health 立即就緒 (liveness)，不必等下面 (可能很慢的)
     # 名稱對照 + 全市場歷史 bootstrap；ranker 備妥後再 attach。避免部署冷啟動時
     # 健康檢查在 90s 內等不到 /health 而誤判失敗、觸發回滾。
@@ -407,6 +417,8 @@ def main(argv=None) -> int:
         # 記憶體裡的歷史，不會多抓一次；同一交易日去重，失敗不中斷。
         if price_ingestor is not None:
             price_ingestor.process(now, ranker)
+        if branch_ingestor is not None:
+            branch_ingestor.process(now)
 
     if args.once:
         _cycle(datetime.now())
