@@ -54,8 +54,26 @@ def _number(value: str) -> int:
     return int(m.group()) if m else 0
 
 
+def _javascript_html(text: str) -> str:
+    """還原富邦放在 document.write/writeln 字串中的 table HTML。"""
+    fragments: list[str] = []
+    pattern = re.compile(
+        r"document\.(?:write|writeln)\s*\(\s*([\"'])(.*?)\1\s*\)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(text):
+        fragment = match.group(2)
+        fragment = (fragment.replace(r"\'", "'")
+                            .replace(r'\"', '"')
+                            .replace(r"\n", "\n")
+                            .replace(r"\r", ""))
+        fragments.append(fragment)
+    return "\n".join(fragments)
+
+
 def fetch_branch_trades(branch: dict[str, str], *, timeout: float = 30) -> list[BranchTrade]:
     query = urllib.parse.urlencode({"a": branch["broker_code"], "b": branch["branch_code"]})
+
     req = urllib.request.Request(FUBON_URL + "?" + query, headers={
         "User-Agent": "Mozilla/5.0 (compatible; StockQuant/1.0)",
         "Accept": "text/html,application/xhtml+xml",
@@ -63,14 +81,23 @@ def fetch_branch_trades(branch: dict[str, str], *, timeout: float = 30) -> list[
     with urllib.request.urlopen(req, timeout=timeout) as response:
         raw = response.read()
         charset = response.headers.get_content_charset() or "big5"
-    text = raw.decode(charset, errors="replace")
-    m = re.search(r"資料日期：\s*(\d{8})", text)
-    if not m:
-        m = re.search(r"資料日期[^0-9]*(\d{8})", text)
+        text = raw.decode(charset, errors="replace")
+    generated_html = _javascript_html(text)
+    parse_text = text + "\n" + generated_html
+    m = re.search(r"資料日期：\s*(\d{8})", parse_text)
+
+        if not m:
+        m = re.search(r"資料日期[^0-9]*(\d{8})", parse_text)
+
+
+
     if not m:
         raise ValueError("富邦頁面找不到資料日期")
-    trade_date = datetime.strptime(m.group(1), "%Y%m%d").date()
-    parser = _TableParser(); parser.feed(text)
+        trade_date = datetime.strptime(m.group(1), "%Y%m%d").date()
+    parser = _TableParser()
+    parser.feed(parse_text)
+
+
     out: list[BranchTrade] = []
     for row in parser.rows:
         if len(row) < 4 or not re.match(r"^\d{4,6}[A-Za-z]?$", row[0].strip()):
