@@ -72,8 +72,8 @@ def _javascript_html(text: str) -> str:
 
 
 def fetch_branch_trades(branch: dict[str, str], *, timeout: float = 30) -> list[BranchTrade]:
-
     query = urllib.parse.urlencode({"a": branch["broker_code"], "b": branch["branch_code"]})
+
     req = urllib.request.Request(FUBON_URL + "?" + query, headers={
         "User-Agent": "Mozilla/5.0 (compatible; StockQuant/1.0)",
         "Accept": "text/html,application/xhtml+xml",
@@ -86,13 +86,17 @@ def fetch_branch_trades(branch: dict[str, str], *, timeout: float = 30) -> list[
     parse_text = text + "\n" + generated_html
     m = re.search(r"資料日期：\s*(\d{8})", parse_text)
 
-    if not m:
-                m = re.search(r"資料日期[^0-9]*(\d{8})", parse_text)
+        if not m:
+        m = re.search(r"資料日期[^0-9]*(\d{8})", parse_text)
+
+
 
     if not m:
         raise ValueError("富邦頁面找不到資料日期")
-    trade_date = datetime.strptime(m.group(1), "%Y%m%d").date()
-        parser = _TableParser(); parser.feed(parse_text)
+        trade_date = datetime.strptime(m.group(1), "%Y%m%d").date()
+    parser = _TableParser()
+    parser.feed(parse_text)
+
 
     out: list[BranchTrade] = []
     for row in parser.rows:
