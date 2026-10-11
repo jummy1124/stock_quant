@@ -285,7 +285,7 @@ def main(argv=None) -> int:
     parser.add_argument("--ignore-hours", action="store_true", help="強制當作盤中 (一律抓即時)")
     args = parser.parse_args(argv)
 
-        market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
+    market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
     notify_time = _parse_hhmm(args.notify_time)
     alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
     ingestor, price_ingestor = _build_ingestor(args)
