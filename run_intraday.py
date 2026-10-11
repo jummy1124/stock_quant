@@ -286,8 +286,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     market = {"twse": Market.TWSE, "tpex": Market.TPEX, "all": None}[args.market]
-    notify_time = _parse_hhmm(args.notify_time)
-        alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
+        notify_time = _parse_hhmm(args.notify_time)
+    alerter = _build_alerter(args.notify == "line", args.notify_mode, notify_time)
     ingestor, price_ingestor = _build_ingestor(args)
     # 先把內嵌 API 起起來，讓 /health 立即就緒 (liveness)，不必等下面 (可能很慢的)
     # 名稱對照 + 全市場歷史 bootstrap；ranker 備妥後再 attach。避免部署冷啟動時
